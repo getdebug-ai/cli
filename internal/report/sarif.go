@@ -8,7 +8,7 @@ import (
 	"io"
 	"sort"
 
-	"github.com/onfafanutifafa/getdebug/cli/internal/scan"
+	"github.com/getdebug-ai/cli/internal/scan"
 )
 
 // SARIF v2.1.0 minimal subset. Spec:
@@ -162,7 +162,7 @@ func WriteSARIF(w io.Writer, findings []scan.Finding, toolVersion string) error 
 			Tool: sarifTool{Driver: sarifDriver{
 				Name:           "getdebug",
 				Version:        toolVersion,
-				InformationURI: "https://github.com/onfafanutifafa/getdebug",
+				InformationURI: "https://github.com/getdebug-ai/cli",
 				Rules:          rules,
 			}},
 			Results: results,

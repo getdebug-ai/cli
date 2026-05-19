@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/onfafanutifafa/getdebug/cli/internal/cmd"
+	"github.com/getdebug-ai/cli/internal/cmd"
 )
 
 func main() {

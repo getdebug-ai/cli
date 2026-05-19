@@ -1,4 +1,4 @@
-module github.com/onfafanutifafa/getdebug/cli
+module github.com/getdebug-ai/cli
 
 go 1.22
 

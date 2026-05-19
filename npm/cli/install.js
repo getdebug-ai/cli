@@ -22,7 +22,7 @@ const { spawnSync } = require("node:child_process");
 const zlib = require("node:zlib");
 
 const VERSION = require("./package.json").version;
-const REPO = "onfafanutifafa/getdebug";
+const REPO = "getdebug-ai/cli";
 const BIN_DIR = path.join(__dirname, "bin");
 
 function platformTriple() {

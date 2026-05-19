@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/onfafanutifafa/getdebug/cli/internal/scan"
+	"github.com/getdebug-ai/cli/internal/scan"
 )
 
 func TestWriteSARIF_EmitsValidStructure(t *testing.T) {

@@ -9,8 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/onfafanutifafa/getdebug/cli/internal/report"
-	"github.com/onfafanutifafa/getdebug/cli/internal/scan"
+	"github.com/getdebug-ai/cli/internal/report"
+	"github.com/getdebug-ai/cli/internal/scan"
 )
 
 var (

@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/onfafanutifafa/getdebug/cli/internal/scan"
+	"github.com/getdebug-ai/cli/internal/scan"
 )
 
 // Severity ordering for sort + ranking against `--fail-on`.

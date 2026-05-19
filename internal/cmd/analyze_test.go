@@ -3,7 +3,7 @@ package cmd
 import (
 	"testing"
 
-	"github.com/onfafanutifafa/getdebug/cli/internal/scan"
+	"github.com/getdebug-ai/cli/internal/scan"
 )
 
 func TestCountAtOrAbove_FailOnHigh(t *testing.T) {

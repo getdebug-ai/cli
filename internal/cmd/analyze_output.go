@@ -5,8 +5,8 @@ import (
 	"io"
 	"os"
 
-	"github.com/onfafanutifafa/getdebug/cli/internal/report"
-	"github.com/onfafanutifafa/getdebug/cli/internal/scan"
+	"github.com/getdebug-ai/cli/internal/report"
+	"github.com/getdebug-ai/cli/internal/scan"
 )
 
 // writeSARIFFile writes a SARIF log atomically: write to a sibling .tmp

@@ -1,15 +1,15 @@
 {
-  "name": "getdebug-cli",
+  "name": "@getdebug-ai/cli",
   "version": "0.1.0",
   "description": "AI-powered codebase analyzer and auto-fixer. Run security + bug checks before you ship.",
   "license": "MIT",
-  "homepage": "https://github.com/onfafanutifafa/getdebug",
+  "homepage": "https://github.com/getdebug-ai/cli",
   "repository": {
     "type": "git",
-    "url": "https://github.com/onfafanutifafa/getdebug.git",
-    "directory": "cli/npm/getdebug-cli"
+    "url": "https://github.com/getdebug-ai/cli.git",
+    "directory": "npm/cli"
   },
-  "bugs": "https://github.com/onfafanutifafa/getdebug/issues",
+  "bugs": "https://github.com/getdebug-ai/cli/issues",
   "keywords": [
     "security",
     "sast",

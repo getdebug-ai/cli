@@ -48,7 +48,7 @@ if (!binary) {
       "getdebug: no prebuilt binary available for this platform.",
       `  platform=${process.platform} arch=${process.arch}`,
       "  Build from source and set GETDEBUG_BINARY:",
-      "    git clone https://github.com/onfafanutifafa/getdebug",
+      "    git clone https://github.com/getdebug-ai/cli",
       "    cd getdebug/cli && go build -o getdebug ./cmd/getdebug",
       "    GETDEBUG_BINARY=$(pwd)/getdebug npx getdebug --help",
       "",
