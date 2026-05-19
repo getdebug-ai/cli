@@ -1,5 +1,5 @@
 {
-  "name": "@getdebug-ai/cli",
+  "name": "@getdebug/cli",
   "version": "0.1.0",
   "description": "AI-powered codebase analyzer and auto-fixer. Run security + bug checks before you ship.",
   "license": "MIT",

@@ -1,25 +1,26 @@
-# @getdebug-ai/cli
+# @getdebug/cli
 
 AI-powered codebase analyzer and auto-fixer. Find bugs and security issues
 before you ship — secrets, dependency CVEs, prompt injection, weak crypto,
 and more. Auto-fix-safe categories ship a PR with the patch attached.
 
-The package is scoped to `@getdebug-ai` because the unscoped `getdebug`
-name was already taken on the registry. Once installed, the binary it
-exposes is plain `getdebug`.
+Published under the `@getdebug` npm scope; source lives at
+[github.com/getdebug-ai/cli](https://github.com/getdebug-ai/cli). The
+short scope name on npm is intentional — your `package.json` and CI
+commands stay clean. Once installed, the binary it exposes is `getdebug`.
 
 ## Quick start
 
 ```sh
 # Run once, no install:
-npx @getdebug-ai/cli analyze .
+npx @getdebug/cli analyze .
 
 # Or install globally — the binary is `getdebug`:
-npm i -g @getdebug-ai/cli
+npm i -g @getdebug/cli
 getdebug analyze .
 
 # Gate your CI on critical + high findings:
-npx @getdebug-ai/cli analyze . --ci --fail-on=high
+npx @getdebug/cli analyze . --ci --fail-on=high
 ```
 
 ## What this package is
