@@ -1,0 +1,24 @@
+# Go build output
+/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# npm — the launcher's bin/ is shipped source; only the downloaded binary
+# (and the pointer file install.js writes) should be ignored.
+npm/cli/bin/getdebug
+npm/cli/bin/getdebug.exe
+npm/cli/bin/.bin-path
+node_modules/
+
+# Local secrets — never commit
+.env
+.env.local
+.env.*.local

@@ -1,0 +1,48 @@
+{
+  "name": "@getdebug/cli",
+  "version": "0.1.0",
+  "description": "AI-powered codebase analyzer and auto-fixer. Run security + bug checks before you ship.",
+  "license": "MIT",
+  "homepage": "https://github.com/getdebug-ai/cli",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/getdebug-ai/cli.git",
+    "directory": "npm/cli"
+  },
+  "bugs": "https://github.com/getdebug-ai/cli/issues",
+  "keywords": [
+    "security",
+    "sast",
+    "static-analysis",
+    "bug-finder",
+    "ai",
+    "claude",
+    "llm",
+    "code-review",
+    "ci",
+    "cli"
+  ],
+  "bin": {
+    "getdebug": "bin/getdebug.cjs"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "bin/getdebug.cjs",
+    "install.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}
