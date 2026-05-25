@@ -27,6 +27,7 @@ func init() {
 	rootCmd.AddCommand(loginCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(analyzeCmd)
+	rootCmd.AddCommand(searchCmd)
 	rootCmd.AddCommand(fixCmd)
 	rootCmd.AddCommand(undoCmd)
 }
