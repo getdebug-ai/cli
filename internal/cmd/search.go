@@ -15,14 +15,18 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/getdebug-ai/cli/internal/config"
+	"github.com/getdebug-ai/cli/internal/localembed"
+	"github.com/getdebug-ai/cli/internal/localindex"
 )
 
 var (
-	searchProjectID string
-	searchK         int
-	searchLangs     []string
-	searchJSON      bool
-	searchTrigger   bool
+	searchProjectID   string
+	searchK           int
+	searchLangs       []string
+	searchJSON        bool
+	searchLocal       bool
+	searchOllamaURL   string
+	searchOllamaModel string
 )
 
 var searchCmd = &cobra.Command{
@@ -31,23 +35,27 @@ var searchCmd = &cobra.Command{
 	Long: `Embeds your query and runs an ANN search against the project's code index.
 Returns the top-K most-similar chunks (functions, methods, classes).
 
-Free-tier feature — the indexer (workers/src/code-index.ts) and search
-endpoint don't gate on plan. Cross-file SAST and the git-history
-narrative that USE the index for Pro Plus depth are separate features.
+Two modes:
 
-The index has to exist first — kick one off with --trigger (or via the
-web dashboard's "Index now" button).`,
+  --local            Search the local index for the current repo. Your code
+                     never leaves your laptop. Index first with
+                     ` + "`getdebug index --local`" + `.
+
+  --project <id>     Search the server-side index. Index first with
+                     ` + "`getdebug index --project <id>`" + ` or via the
+                     web dashboard.`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runSearch,
 }
 
 func init() {
-	searchCmd.Flags().StringVar(&searchProjectID, "project", "", "project id (required)")
+	searchCmd.Flags().StringVar(&searchProjectID, "project", "", "project id (remote mode)")
+	searchCmd.Flags().BoolVar(&searchLocal, "local", false, "search the local index for the current repo")
 	searchCmd.Flags().IntVar(&searchK, "k", 10, "number of results")
 	searchCmd.Flags().StringSliceVar(&searchLangs, "lang", nil, "filter by language (repeatable)")
 	searchCmd.Flags().BoolVar(&searchJSON, "json", false, "emit JSON instead of the formatted list")
-	searchCmd.Flags().BoolVar(&searchTrigger, "trigger", false, "instead of searching, enqueue a full re-index of the project")
-	_ = searchCmd.MarkFlagRequired("project")
+	searchCmd.Flags().StringVar(&searchOllamaURL, "ollama-url", envOr("GETDEBUG_OLLAMA_URL", localembed.DefaultBaseURL), "Ollama base URL (local mode)")
+	searchCmd.Flags().StringVar(&searchOllamaModel, "model", envOr("GETDEBUG_OLLAMA_MODEL", localembed.DefaultModel), "Ollama embedding model (local mode)")
 }
 
 type searchResult struct {
@@ -68,6 +76,18 @@ type searchResponse struct {
 }
 
 func runSearch(cmd *cobra.Command, args []string) error {
+	query := strings.TrimSpace(strings.Join(args, " "))
+	if query == "" {
+		return errors.New("query required")
+	}
+
+	if searchLocal {
+		return runLocalSearch(cmd, query)
+	}
+
+	if searchProjectID == "" {
+		return errors.New("either --local or --project <id> is required")
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -75,15 +95,6 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	if cfg.Token == "" || cfg.APIBaseURL == "" {
 		cmd.PrintErrln("Not logged in. Run `getdebug login` first.")
 		os.Exit(1)
-	}
-
-	if searchTrigger {
-		return triggerIndex(cmd, cfg, searchProjectID)
-	}
-
-	query := strings.TrimSpace(strings.Join(args, " "))
-	if query == "" {
-		return errors.New("query required")
 	}
 
 	body := map[string]any{
@@ -109,7 +120,7 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(resp.Results) == 0 {
-		cmd.Println("No matches. Has this project been indexed? Re-run with --trigger to kick one off.")
+		cmd.Println("No matches. Has this project been indexed? Run `getdebug index --project <id>` first.")
 		return nil
 	}
 
@@ -121,19 +132,85 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func triggerIndex(cmd *cobra.Command, cfg *config.Config, projectID string) error {
-	ctx, cancel := context.WithTimeout(cmd.Context(), 15*time.Second)
+// runLocalSearch queries the on-disk index built by `getdebug index --local`.
+// Never touches the api or network — embedding goes to Ollama on localhost,
+// ANN runs in-process.
+func runLocalSearch(cmd *cobra.Command, query string) error {
+	ctx, cancel := context.WithTimeout(cmd.Context(), 60*time.Second)
 	defer cancel()
-	var resp struct {
-		JobID  string `json:"jobId"`
-		Status string `json:"status"`
-	}
-	if err := apiPost(ctx, cfg, "/v1/projects/"+projectID+"/index", map[string]any{}, &resp); err != nil {
+
+	root, err := gitRepoRootOrCwd()
+	if err != nil {
 		return err
 	}
-	cmd.Printf("Queued code-index job %s (status=%s). Re-run `getdebug search` once the workers complete it.\n",
-		resp.JobID, resp.Status)
+	originURL := gitRemoteOriginURL()
+
+	ollama := localembed.New(searchOllamaURL)
+	if err := ollama.Ping(ctx, searchOllamaModel); err != nil {
+		return err
+	}
+	// Probe dim — must match what was used at index time. The store will
+	// refuse to open if the model changed, with a clearer error.
+	probe, err := ollama.EmbedOne(ctx, searchOllamaModel, "hello")
+	if err != nil {
+		return fmt.Errorf("ollama probe: %w", err)
+	}
+	store, err := localindex.Open(originURL, root, searchOllamaModel, len(probe))
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
+	queryVec, err := ollama.EmbedOne(ctx, searchOllamaModel, query)
+	if err != nil {
+		return fmt.Errorf("embed query: %w", err)
+	}
+	results, err := store.Search(queryVec, searchK, searchLangs)
+	if err != nil {
+		return err
+	}
+
+	if searchJSON {
+		out, _ := json.Marshal(struct {
+			Query   string         `json:"query"`
+			K       int            `json:"k"`
+			Results []searchResult `json:"results"`
+		}{
+			Query: query,
+			K:     searchK,
+			Results: mapResults(results),
+		})
+		fmt.Fprintln(cmd.OutOrStdout(), string(out))
+		return nil
+	}
+
+	if len(results) == 0 {
+		cmd.Println("No matches in the local index. Run `getdebug index --local` first?")
+		return nil
+	}
+	for i, r := range results {
+		fmt.Fprintf(cmd.OutOrStdout(), "\n%d. \033[36m%s:%d-%d\033[0m  (%s · %s · score=%.3f)\n",
+			i+1, r.RelPath, r.LineStart, r.LineEnd, r.Kind, r.Language, r.Score)
+		fmt.Fprintln(cmd.OutOrStdout(), indent(r.Content, "   "))
+	}
 	return nil
+}
+
+func mapResults(in []localindex.SearchResult) []searchResult {
+	out := make([]searchResult, len(in))
+	for i, r := range in {
+		out[i] = searchResult{
+			ChunkID:   r.ChunkID,
+			RelPath:   r.RelPath,
+			Language:  r.Language,
+			Kind:      r.Kind,
+			LineStart: r.LineStart,
+			LineEnd:   r.LineEnd,
+			Score:     r.Score,
+			Content:   r.Content,
+		}
+	}
+	return out
 }
 
 // ─── HTTP helper (POST) ─────────────────────────────────────────
