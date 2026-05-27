@@ -99,6 +99,18 @@ func ChunkRepo(root string, onFileError func(path string, err error)) ([]localin
 			}
 			return nil
 		}
+		// Reject symlinks for both files and directories. WalkDir resolves
+		// the dirent's type via Lstat (no follow), so this catches them
+		// before they're descended into. A repo with `.tooling -> /etc`
+		// would otherwise let the indexer slurp system files into the
+		// local pgvector store — and in the hosted path, ship them to the
+		// embedding provider.
+		if d.Type()&fs.ModeSymlink != 0 {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
 		if d.IsDir() {
 			name := d.Name()
 			if _, skip := skipDirs[name]; skip {

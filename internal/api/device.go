@@ -145,6 +145,13 @@ func (c *Client) PollOnce(ctx context.Context, deviceCode string) (*DeviceTokenR
 // PollUntilApproved repeatedly calls PollOnce honouring the slow_down /
 // pending semantics. progress is invoked on each tick so the CLI can update
 // the spinner. Returns the token response on approval, or a terminal error.
+//
+// Defence against a compromised / hostile backend that returns slow_down
+// indefinitely to keep the login hanging: cap consecutive slow_down
+// responses, then bail with ErrSlowDown so the user gets a clear error
+// instead of a forever-pinwheel. The context deadline is the outer
+// bound; this is the inner one so a hostile server can't soak the full
+// 10-minute device-code TTL waiting for the user to give up.
 func (c *Client) PollUntilApproved(
 	ctx context.Context,
 	deviceCode string,
@@ -152,7 +159,9 @@ func (c *Client) PollUntilApproved(
 	maxInterval time.Duration,
 	progress func(),
 ) (*DeviceTokenResponse, error) {
+	const maxConsecutiveSlowDown = 5
 	current := interval
+	slowDownStreak := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -169,7 +178,13 @@ func (c *Client) PollUntilApproved(
 		switch {
 		case errors.Is(err, ErrAuthorizationPending):
 			// keep current interval
+			slowDownStreak = 0
 		case errors.Is(err, ErrSlowDown):
+			slowDownStreak++
+			if slowDownStreak >= maxConsecutiveSlowDown {
+				return nil, fmt.Errorf("server kept asking us to slow down (%d times); aborting login: %w",
+					slowDownStreak, ErrSlowDown)
+			}
 			current *= 2
 			if current > maxInterval {
 				current = maxInterval

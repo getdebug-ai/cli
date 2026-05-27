@@ -362,6 +362,12 @@ func gitApply(root, patch string, checkOnly bool) error {
 //
 // We read the `+++` (post-change) line because that's what matters for
 // backup. /dev/null indicates a deletion; we skip it.
+//
+// Every returned path is validated to be a repo-relative path that does
+// not escape via `..` or absolute roots. A patch from a compromised API
+// (or a MITM'd `--api http://...`) could otherwise drive the backup loop
+// in applyPatch to read or write arbitrary files under the user's UID
+// before git's own path checks ever ran.
 func filesFromPatch(patch string) ([]string, error) {
 	seen := map[string]struct{}{}
 	out := []string{}
@@ -381,6 +387,9 @@ func filesFromPatch(patch string) ([]string, error) {
 		if p == "" || p == "/dev/null" {
 			continue
 		}
+		if err := validateRepoRelPath(p); err != nil {
+			return nil, fmt.Errorf("patch references unsafe path %q: %w", p, err)
+		}
 		if _, ok := seen[p]; ok {
 			continue
 		}
@@ -388,6 +397,40 @@ func filesFromPatch(patch string) ([]string, error) {
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+// validateRepoRelPath rejects patch paths that aren't repo-relative.
+// Disallows: absolute paths, drive-letter paths, paths containing `..`
+// segments, paths with a leading separator, and Windows-style backslashes
+// (which `filepath.Clean` doesn't normalize on Unix but `os.Open` may
+// still treat as part of the filename). The check must happen on the raw
+// string — `filepath.Clean` would silently fold `a/../etc` into `etc`
+// and hide the intent.
+func validateRepoRelPath(p string) error {
+	if p == "" {
+		return errors.New("empty path")
+	}
+	if filepath.IsAbs(p) {
+		return errors.New("absolute path")
+	}
+	// Windows drive letters slip past filepath.IsAbs on Unix builds.
+	if len(p) >= 2 && p[1] == ':' {
+		return errors.New("drive-letter path")
+	}
+	// Reject backslash-as-separator paths outright: we can't tell on Unix
+	// what the user's filesystem will do with them, and they're never a
+	// legitimate git diff path.
+	if strings.ContainsRune(p, '\\') {
+		return errors.New("backslash in path")
+	}
+	cleaned := filepath.ToSlash(filepath.Clean(p))
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return errors.New("path escapes repo root")
+	}
+	if strings.HasPrefix(cleaned, "/") {
+		return errors.New("leading slash")
+	}
+	return nil
 }
 
 func copyFile(src, dst string) error {

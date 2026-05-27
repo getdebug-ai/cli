@@ -53,7 +53,10 @@ func runLogin(cmd *cobra.Command, _ []string) error {
 	if loginAPIBaseURL == "" {
 		return errors.New("--api is required (or set GETDEBUG_API_URL)")
 	}
-	client := api.New(loginAPIBaseURL, "")
+	client, err := api.New(loginAPIBaseURL, "")
+	if err != nil {
+		return fmt.Errorf("--api: %w", err)
+	}
 
 	cmd.PrintErrf("Requesting device code from %s …\n", loginAPIBaseURL)
 	code, err := client.RequestDeviceCode(ctx, loginClientName)
