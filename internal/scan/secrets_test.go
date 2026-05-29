@@ -8,6 +8,22 @@ import (
 	"testing"
 )
 
+// Test-fixture tokens. Built via string concatenation so the literal that
+// lands in the source file does not match either GitHub's push-protection
+// secret scanner or our own detector when scanning this repo. The runtime
+// values still match — that's the whole point of the test.
+//
+// Don't inline a contiguous AWS/GH/Stripe-shaped string anywhere in this
+// file. The only tokens the test framework needs are these constants.
+var (
+	fixtureAWS    = "AKIA" + "IOSFODNN7EXAMPLE"
+	fixtureGHPAT  = "ghp_" + strings.Repeat("A", 36)
+	fixtureStripe = "sk_live_" + "1234567890abcdefghijklmnop"
+	// UUID shape — only flagged by the Heroku detector when "heroku" is on
+	// the same line (the regex shape is too broad to flag standalone).
+	fixtureHerokuUUID = "12345678-1234-1234-1234" + "-123456789012"
+)
+
 // findByPattern returns the findings whose Pattern matches needle. Tests use
 // this rather than positional indexing — append-order is an implementation
 // detail.
@@ -39,11 +55,7 @@ func writeTree(t *testing.T, files map[string]string) string {
 
 func TestScanSecrets_DetectsProviderTokensViaRegex(t *testing.T) {
 	root := writeTree(t, map[string]string{
-		"src/config.ts": `
-const AWS = "AKIAIOSFODNN7EXAMPLE";
-const GH = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-const STRIPE = "sk_live_1234567890abcdefghijklmnop";
-`,
+		"src/config.ts": "const AWS = \"" + fixtureAWS + "\";\nconst GH = \"" + fixtureGHPAT + "\";\nconst STRIPE = \"" + fixtureStripe + "\";\n",
 	})
 	res, err := ScanSecrets(ScanOptions{Workdir: root})
 	if err != nil {
@@ -123,12 +135,12 @@ func TestScanSecrets_EntropySkippedInTestsDocsAndEnvExamples(t *testing.T) {
 func TestScanSecrets_SkipsBuildArtifactsAndLockfiles(t *testing.T) {
 	// Lockfile content with what looks like a Stripe key — should NOT be scanned.
 	root := writeTree(t, map[string]string{
-		"package-lock.json": `{"resolved":"sk_live_1234567890abcdefghijklmnop"}`,
-		"app.tsbuildinfo":   `{"k":"sk_live_1234567890abcdefghijklmnop"}`,
-		"bundle.js.map":     `{"k":"sk_live_1234567890abcdefghijklmnop"}`,
+		"package-lock.json": `{"resolved":"` + fixtureStripe + `"}`,
+		"app.tsbuildinfo":   `{"k":"` + fixtureStripe + `"}`,
+		"bundle.js.map":     `{"k":"` + fixtureStripe + `"}`,
 		// Same content in a regular .ts file → must be detected to prove the
 		// negative cases above are about file selection, not the pattern.
-		"src/real.ts": `const k = "sk_live_1234567890abcdefghijklmnop";` + "\n",
+		"src/real.ts": `const k = "` + fixtureStripe + `";` + "\n",
 	})
 	res, err := ScanSecrets(ScanOptions{Workdir: root})
 	if err != nil {
@@ -146,10 +158,10 @@ func TestScanSecrets_SkipsBuildArtifactsAndLockfiles(t *testing.T) {
 
 func TestScanSecrets_SkipsKnownDirs(t *testing.T) {
 	root := writeTree(t, map[string]string{
-		"node_modules/dep/leak.ts": `const k = "AKIAIOSFODNN7EXAMPLE";` + "\n",
-		".git/hooks/leak":          `const k = "AKIAIOSFODNN7EXAMPLE";` + "\n",
-		"dist/bundle.ts":           `const k = "AKIAIOSFODNN7EXAMPLE";` + "\n",
-		"src/real.ts":              `const k = "AKIAIOSFODNN7EXAMPLE";` + "\n",
+		"node_modules/dep/leak.ts": `const k = "` + fixtureAWS + `";` + "\n",
+		".git/hooks/leak":          `const k = "` + fixtureAWS + `";` + "\n",
+		"dist/bundle.ts":           `const k = "` + fixtureAWS + `";` + "\n",
+		"src/real.ts":              `const k = "` + fixtureAWS + `";` + "\n",
 	})
 	res, err := ScanSecrets(ScanOptions{Workdir: root})
 	if err != nil {
@@ -183,9 +195,9 @@ func TestScanSecrets_PlaceholderValuesAreSuppressed(t *testing.T) {
 func TestScanSecrets_HerokuRequiresContextWord(t *testing.T) {
 	root := writeTree(t, map[string]string{
 		// A UUID-shaped string alone is not a finding.
-		"src/notes.ts": `const id = "12345678-1234-1234-1234-123456789012";` + "\n",
+		"src/notes.ts": `const id = "` + fixtureHerokuUUID + `";` + "\n",
 		// Same UUID with "heroku" on the line is.
-		"src/heroku.ts": `const heroku_key = "12345678-1234-1234-1234-123456789012";` + "\n",
+		"src/heroku.ts": `const heroku_key = "` + fixtureHerokuUUID + `";` + "\n",
 	})
 	res, err := ScanSecrets(ScanOptions{Workdir: root})
 	if err != nil {
@@ -202,8 +214,8 @@ func TestScanSecrets_HerokuRequiresContextWord(t *testing.T) {
 
 func TestScanSecrets_HonorsIgnoreList(t *testing.T) {
 	root := writeTree(t, map[string]string{
-		"src/a.ts": `const k = "AKIAIOSFODNN7EXAMPLE";` + "\n",
-		"src/b.ts": `const k = "AKIAIOSFODNN7EXAMPLE";` + "\n",
+		"src/a.ts": `const k = "` + fixtureAWS + `";` + "\n",
+		"src/b.ts": `const k = "` + fixtureAWS + `";` + "\n",
 	})
 	res, err := ScanSecrets(ScanOptions{
 		Workdir: root,
@@ -222,7 +234,7 @@ func TestScanSecrets_HonorsIgnoreList(t *testing.T) {
 
 func TestScanSecrets_ContentHashIsStableAcrossRuns(t *testing.T) {
 	tree := map[string]string{
-		"src/a.ts": `const k = "AKIAIOSFODNN7EXAMPLE";` + "\n",
+		"src/a.ts": `const k = "` + fixtureAWS + `";` + "\n",
 	}
 	root1 := writeTree(t, tree)
 	root2 := writeTree(t, tree)
