@@ -25,8 +25,10 @@ func Execute() error {
 
 func init() {
 	rootCmd.AddCommand(loginCmd)
-	rootCmd.AddCommand(analyzeCmd)
-	rootCmd.AddCommand(fixCmd)
 	rootCmd.AddCommand(statusCmd)
+	rootCmd.AddCommand(analyzeCmd)
+	rootCmd.AddCommand(indexCmd)
+	rootCmd.AddCommand(searchCmd)
+	rootCmd.AddCommand(fixCmd)
 	rootCmd.AddCommand(undoCmd)
 }
