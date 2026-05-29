@@ -140,7 +140,7 @@ func defaultAPIBaseURL() string {
 	if cfg != nil && cfg.APIBaseURL != "" {
 		return cfg.APIBaseURL
 	}
-	return "https://api.getdebug.ai"
+	return "https://api.getdebug.dev"
 }
 
 // defaultClientName is what shows up on the approval page + in the dashboard's

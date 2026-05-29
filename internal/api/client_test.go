@@ -7,9 +7,9 @@ import (
 
 func TestNew_AcceptsHTTPS(t *testing.T) {
 	cases := []string{
-		"https://api.getdebug.ai",
-		"https://api.getdebug.ai:443",
-		"https://api.getdebug.ai/v1",
+		"https://api.getdebug.dev",
+		"https://api.getdebug.dev:443",
+		"https://api.getdebug.dev/v1",
 		"https://staging.example.com",
 	}
 	for _, u := range cases {
@@ -50,11 +50,11 @@ func TestNew_RejectsInsecureRemote(t *testing.T) {
 	// front of a user. Refuse loudly — the device-flow token would
 	// otherwise be exchanged in cleartext.
 	cases := []string{
-		"http://api.getdebug.ai",
+		"http://api.getdebug.dev",
 		"http://staging.example.com",
 		"http://198.51.100.7",
 		"http://attacker.local",
-		"http://api.getdebug.ai:80",
+		"http://api.getdebug.dev:80",
 	}
 	for _, u := range cases {
 		t.Run(u, func(t *testing.T) {
