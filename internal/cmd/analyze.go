@@ -9,17 +9,21 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/getdebug-ai/cli/internal/localllm"
 	"github.com/getdebug-ai/cli/internal/report"
 	"github.com/getdebug-ai/cli/internal/scan"
 )
 
 var (
-	analyzeWatch  bool
-	analyzeCI     bool
-	analyzeFailOn string
-	analyzeSARIF  string
-	analyzeJSON   bool
-	analyzeQuiet  bool
+	analyzeWatch        bool
+	analyzeCI           bool
+	analyzeFailOn       string
+	analyzeSARIF        string
+	analyzeJSON         bool
+	analyzeQuiet        bool
+	analyzeLocalLLM     bool
+	analyzeLocalLLMModel string
+	analyzeLocalLLMMax  int
 )
 
 // validFailOnLevels mirrors the docs: critical | high | medium | low | any.
@@ -43,6 +47,11 @@ keys, private key blocks, high-entropy strings near credential keywords).
 Cross-file SAST and the LLM-app pattern catalog require uploading to the
 getdebug API, which is on the roadmap and not yet wired into this CLI.
 
+With --local-llm an AI-based SAST pass runs against a LOCAL Ollama chat
+model (Qwen, DeepSeek, Llama, …) so code never leaves the laptop and you
+pay nothing per scan. Install Ollama (https://ollama.ai) and pull a model
+first: 'ollama pull qwen2.5-coder:7b'. Use --local-llm-model to override.
+
 Exit codes:
   0  no findings, or findings below the --fail-on threshold
   1  findings at or above --fail-on threshold (only when --ci is set)
@@ -51,6 +60,12 @@ Exit codes:
 Examples:
   # Local scan, pretty output:
   getdebug analyze .
+
+  # Local secrets + local-LLM SAST (Ollama):
+  getdebug analyze . --local-llm
+
+  # Same, with a stronger model + bigger budget:
+  getdebug analyze . --local-llm --local-llm-model=deepseek-r1:7b --local-llm-max-files=200
 
   # CI gate — fail the build on any critical finding:
   getdebug analyze . --ci --fail-on=critical
@@ -68,6 +83,12 @@ func init() {
 	analyzeCmd.Flags().StringVar(&analyzeSARIF, "sarif", "", "write SARIF 2.1.0 results to this path (for GitHub Code Scanning)")
 	analyzeCmd.Flags().BoolVar(&analyzeJSON, "json", false, "emit findings as newline-delimited JSON instead of the table")
 	analyzeCmd.Flags().BoolVar(&analyzeQuiet, "quiet", false, "suppress the scan-progress banner")
+	analyzeCmd.Flags().BoolVar(&analyzeLocalLLM, "local-llm", false,
+		"also run an AI-based SAST pass using a LOCAL Ollama chat model (code never leaves the laptop)")
+	analyzeCmd.Flags().StringVar(&analyzeLocalLLMModel, "local-llm-model", "",
+		"Ollama model for --local-llm (default: qwen2.5-coder:7b). Examples: deepseek-r1:7b, llama3.1:8b")
+	analyzeCmd.Flags().IntVar(&analyzeLocalLLMMax, "local-llm-max-files", 0,
+		"cap files sent to the local model in one scan (default 50). Higher = more coverage, longer wall-clock.")
 }
 
 func runAnalyze(cmd *cobra.Command, args []string) error {
@@ -114,6 +135,46 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Fprintf(cmd.ErrOrStderr(), "scanned %d files in %s%s\n",
 			res.ScannedFiles, elapsed.Round(time.Millisecond), hint)
+	}
+
+	// Optional: local-LLM SAST pass via Ollama. Runs AFTER the secrets pass
+	// so the regex findings always surface, even if Ollama is down or the
+	// model errors. Findings from the model are merged into res.Findings.
+	if analyzeLocalLLM {
+		model := analyzeLocalLLMModel
+		if model == "" {
+			model = localllm.DefaultModel
+		}
+		client := localllm.New(os.Getenv("GETDEBUG_OLLAMA_URL"))
+		if err := client.Ping(cmd.Context(), model); err != nil {
+			return fmt.Errorf("--local-llm: %w", err)
+		}
+		if !analyzeQuiet {
+			fmt.Fprintf(cmd.ErrOrStderr(), "local-llm SAST: %s via Ollama …\n", model)
+		}
+		sastStart := time.Now()
+		sastRes, sastErr := scan.ScanSastLocal(cmd.Context(), scan.SastLocalOptions{
+			Workdir:  abs,
+			Client:   client,
+			Model:    model,
+			MaxFiles: analyzeLocalLLMMax,
+			Logf: func(format string, args ...any) {
+				if !analyzeQuiet {
+					fmt.Fprintf(cmd.ErrOrStderr(), "  "+format, args...)
+				}
+			},
+		})
+		if sastErr != nil {
+			return fmt.Errorf("local-llm: %w", sastErr)
+		}
+		if !analyzeQuiet {
+			fmt.Fprintf(cmd.ErrOrStderr(),
+				"local-llm: analyzed %d of %d in %s · %d malformed · %d errors\n",
+				sastRes.FilesScanned, sastRes.FilesConsidered,
+				time.Since(sastStart).Round(time.Second),
+				sastRes.Malformed, sastRes.Errors)
+		}
+		res.Findings = append(res.Findings, sastRes.Findings...)
 	}
 
 	if analyzeSARIF != "" {
