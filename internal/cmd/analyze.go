@@ -26,6 +26,12 @@ var (
 	analyzeLocalLLMMax  int
 )
 
+// ErrCIThresholdExceeded is returned by runAnalyze when --ci is set and at
+// least one finding lands at or above the --fail-on threshold. main.go
+// translates it into a silent exit(1) so CI logs aren't doubled-up by the
+// generic error printer.
+var ErrCIThresholdExceeded = errors.New("getdebug: ci threshold exceeded")
+
 // validFailOnLevels mirrors the docs: critical | high | medium | low | any.
 // "any" means anything above `info` — fail on every concrete finding.
 var validFailOnLevels = map[string]struct{}{
@@ -202,7 +208,7 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 			countAtOrAbove(res.Findings, analyzeFailOn), analyzeFailOn)
 		cmd.SilenceErrors = true
 		cmd.SilenceUsage = true
-		os.Exit(1)
+		return ErrCIThresholdExceeded
 	}
 	return nil
 }
