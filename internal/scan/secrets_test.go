@@ -255,6 +255,108 @@ func TestScanSecrets_ContentHashIsStableAcrossRuns(t *testing.T) {
 	}
 }
 
+// FP-audit regression tests — these cases come from the 2026-05-31 sweep of
+// 20 less-curated AI starter repos, where every single "critical" finding
+// turned out to be a false positive. See PR commit message + the
+// credibility-scan post for context.
+
+// Rule A — broader env-template matching. Pre-fix only `.env.example` and
+// `.env.sample` skipped entropy; `.env.template` (the convention used by
+// e.g. stackitcloud/rag-template) leaked through. ALSO the regex pass
+// fired on these files even when entropy didn't, so `.env.example` with
+// an AWS-shaped placeholder would still trip Pass 1.
+func TestScanSecrets_FP_EnvTemplateVariantsAreSkippedEntirely(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		".env.template":          "LANGFUSE_SECRET_KEY=sk-lf-your-secret-key-here\n",
+		".env.sample":            "STACKIT_API_KEY=your-stackit-api-key\n",
+		".env.dist":              "AWS_KEY=" + fixtureAWS + "\n",
+		".env.tpl":               "STRIPE=" + fixtureStripe + "\n",
+		".env.local.template":    "STRIPE=" + fixtureStripe + "\n",
+		"infra/k8s/.env.langfuse.template": "LANGFUSE_INIT_PROJECT_SECRET_KEY=your-project-secret-key\n",
+		// Negative control: real .env should still flag.
+		".env":                   "AWS_KEY=" + fixtureAWS + "\n",
+	})
+	res, err := ScanSecrets(ScanOptions{Workdir: root})
+	if err != nil {
+		t.Fatalf("ScanSecrets: %v", err)
+	}
+	for _, f := range res.Findings {
+		if f.FilePath != ".env" {
+			t.Errorf("unexpected finding in template file %s: %s", f.FilePath, f.Title)
+		}
+	}
+	if len(findByPattern(t, res.Findings, "AWS access key")) == 0 {
+		t.Errorf("regression: real .env AWS key no longer detected. files=%v", allFiles(res.Findings))
+	}
+}
+
+// Rule B — PEM "Private key block" in CHANGELOG/SNAPSHOT/README files is
+// nearly always a documentation example, not a leaked key. Came from
+// alexeykrol/claude-code-starter (5 hits in archived CHANGELOG.md +
+// SNAPSHOT.md + an exporter.ts that emits PEM-formatted output).
+func TestScanSecrets_FP_PrivateKeyBlockInDocsIsSuppressed(t *testing.T) {
+	const pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQ...\n-----END PRIVATE KEY-----"
+	root := writeTree(t, map[string]string{
+		"CHANGELOG.md":             "## v4 — added export.\n```\n" + pem + "\n```\n",
+		"archive/SNAPSHOT.md":      "Example output: " + pem + "\n",
+		"docs/usage.md":            "After export you'll see\n" + pem + "\n",
+		"README.md":                "Sample key shape: " + pem + "\n",
+		// Negative control: same content in a code file MUST still flag.
+		"src/keys.go":              "var k = `" + pem + "`\n",
+	})
+	res, err := ScanSecrets(ScanOptions{Workdir: root})
+	if err != nil {
+		t.Fatalf("ScanSecrets: %v", err)
+	}
+	for _, f := range res.Findings {
+		if strings.HasSuffix(f.FilePath, ".md") || strings.Contains(f.FilePath, "SNAPSHOT") {
+			t.Errorf("unexpected PEM finding in doc file %s: %s", f.FilePath, f.Title)
+		}
+	}
+	if len(findByPattern(t, res.Findings, "Private key block")) == 0 {
+		t.Errorf("regression: PEM in src/keys.go no longer detected. files=%v", allFiles(res.Findings))
+	}
+}
+
+// Rule C — env-var name reads (`import.meta.env.X`, `process.env.X`,
+// `os.environ[...]`, `os.getenv(...)`) match valueCandidate + sit next
+// to a `password`/`key` keyword, so the entropy pass would flag them.
+// They aren't values — they're the names of env vars being read. Came
+// from stackitcloud/rag-template (`import.meta.env.VITE_AUTH_PASSWORD`).
+func TestScanSecrets_FP_EnvVarReadsAreNotEntropyHits(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"src/api.ts":   "const p = import.meta.env.VITE_AUTH_PASSWORD;\n",
+		"src/node.ts":  "const k = process.env.STRIPE_SECRET_KEY;\n",
+		"src/server.py": "key = os.environ['ANTHROPIC_API_KEY']\n",
+		"src/getenv.py": "tok = os.getenv('GITHUB_TOKEN')\n",
+		// Negative control: a real high-entropy assignment near 'password'
+		// still flags.
+		"src/real.ts":  "const password = \"k3jLp9QwZx8Vm2nB7yT4hF6sD1aRcXeP\";\n",
+	})
+	res, err := ScanSecrets(ScanOptions{Workdir: root})
+	if err != nil {
+		t.Fatalf("ScanSecrets: %v", err)
+	}
+	for _, f := range res.Findings {
+		if f.Detection == "entropy" && f.FilePath != "src/real.ts" {
+			t.Errorf("unexpected entropy finding in %s: %s", f.FilePath, f.Snippet)
+		}
+	}
+	if len(findByPattern(t, res.Findings, "")) == 0 {
+		// entropy findings have empty Pattern; check Detection.
+		found := false
+		for _, f := range res.Findings {
+			if f.Detection == "entropy" && f.FilePath == "src/real.ts" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("regression: real entropy hit in src/real.ts no longer detected. all=%+v", res.Findings)
+		}
+	}
+}
+
 // allPatterns + allFiles are test-debug helpers — make error messages useful.
 func allPatterns(fs []Finding) []string {
 	out := make([]string, 0, len(fs))

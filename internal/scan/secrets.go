@@ -139,25 +139,63 @@ var (
 	testFile        = regexp.MustCompile(`(?i)\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|py)$`)
 	testDir         = regexp.MustCompile(`(?i)(^|/)(__tests__|__mocks__|tests?|specs?|fixtures?)/`)
 	markdownExt     = regexp.MustCompile(`(?i)\.(md|mdx)$`)
-	envExample      = regexp.MustCompile(`(?i)(^|/)\.env(\.[^/]+)?\.example$`)
-	envSample       = regexp.MustCompile(`(?i)(^|/)\.env\.sample$`)
+	// envTemplate matches files that exist explicitly to document required
+	// env vars with placeholder values: `.env.example`, `.env.sample`,
+	// `.env.template`, `.env.dist`, `.env.tpl`, and the suffix variants
+	// (`.env.local.example`, `.env.prod.template`, etc.). These files are
+	// skipped from BOTH the regex pass and the entropy pass — they're
+	// docs by convention. Supersedes the older `envExample` + `envSample`
+	// pair which only suppressed entropy.
+	envTemplate     = regexp.MustCompile(`(?i)(^|/)\.env(\.[^/]+)?\.(example|sample|template|dist|tpl)$`)
+	// docFile matches files where regex hits for "Private key block" and
+	// similar PEM-shaped patterns are almost certainly documentation
+	// examples, not committed credentials. CHANGELOG/SNAPSHOT/README/.md
+	// are the routine offenders. Used by docSuppressedPatterns below.
+	docFile         = regexp.MustCompile(`(?i)(\.(md|mdx|rst|txt|adoc)$|(^|/)(CHANGELOG|HISTORY|SNAPSHOT|README|NOTES)(\..+)?$)`)
+	// envVarRead matches references to env-var accessors. The value the
+	// detector picks up (e.g. `import.meta.env.VITE_AUTH_PASSWORD`) is
+	// the name of an env var being read, not the secret itself. Skip
+	// in entropy pass — the actual secret, if any, lives at the env-var
+	// definition, which lives in a `.env` file the regex pass already covers.
+	envVarRead      = regexp.MustCompile(`(?i)(process\.env|import\.meta\.env|os\.environ|os\.getenv|System\.getenv)`)
 	herokuContextRe = regexp.MustCompile(`(?i)heroku`)
 )
 
+// docSuppressedPatterns names patterns whose regex hits in doc files
+// (per docFile above) are FP-shaped. Adding here is a tighter trade than
+// dropping the pattern entirely: regular code paths still flag, only
+// documentation matches are suppressed.
+var docSuppressedPatterns = map[string]struct{}{
+	"Private key block": {},
+}
+
 // entropyScanEnabled mirrors the TS predicate of the same name. Pass 1
-// (regex) runs on every file; Pass 2 (entropy) is suppressed for tests,
-// docs, and env templates where high-entropy strings are routine.
+// (regex) runs on every file BY DEFAULT but is also skipped for env
+// templates via secretScanEligible below (otherwise placeholder values
+// in `.env.template` files generate critical-severity FPs). Pass 2
+// (entropy) is additionally suppressed for tests, markdown, and env
+// templates where high-entropy strings are routine.
 func entropyScanEnabled(relPath string) bool {
 	rel := filepath.ToSlash(relPath)
 	switch {
 	case testFile.MatchString(rel),
 		testDir.MatchString(rel),
 		markdownExt.MatchString(rel),
-		envExample.MatchString(rel),
-		envSample.MatchString(rel):
+		envTemplate.MatchString(rel):
 		return false
 	}
 	return true
+}
+
+// secretScanEligible returns false for files that are documented placeholder
+// territory and should be skipped by BOTH the regex and entropy passes.
+// Today this is just env templates (`.env.example`, `.env.template`, ...).
+// Other detectors (test fixtures, markdown) remain eligible for the regex
+// pass because real secrets in those locations are still secrets — but
+// .env.<placeholder-suffix> files are explicitly docs by convention.
+func secretScanEligible(relPath string) bool {
+	rel := filepath.ToSlash(relPath)
+	return !envTemplate.MatchString(rel)
 }
 
 func shannonEntropy(s string) float64 {
@@ -324,7 +362,15 @@ func walkDir(root, dir string, ignore map[string]struct{}, seen map[string]struc
 }
 
 func scanContent(content []byte, rel string, seen map[string]struct{}, out *[]Finding) {
+	// Files that exist explicitly to document env-var shapes (`.env.template`,
+	// `.env.example`, etc.) are skipped wholesale — both regex and entropy
+	// passes. They're placeholder territory by convention; flagging
+	// `sk-your-key-here` as critical is noise.
+	if !secretScanEligible(rel) {
+		return
+	}
 	runEntropy := entropyScanEnabled(rel)
+	inDoc := docFile.MatchString(rel)
 	lines := splitLines(content)
 	for i, line := range lines {
 		if line == "" {
@@ -337,6 +383,14 @@ func scanContent(content []byte, rel string, seen map[string]struct{}, out *[]Fi
 			// Heroku UUID is over-broad alone; require "heroku" on the line.
 			if pat.label == "Heroku API key" && !herokuContextRe.MatchString(line) {
 				continue
+			}
+			// FP-shaped patterns (e.g. "Private key block") in docs/CHANGELOGs
+			// are documentation, not credentials. Suppress for the
+			// well-known offenders rather than dropping the pattern globally.
+			if inDoc {
+				if _, suppress := docSuppressedPatterns[pat.label]; suppress {
+					continue
+				}
 			}
 			matches := pat.re.FindAllStringIndex(line, -1)
 			for _, m := range matches {
@@ -381,6 +435,16 @@ func scanContent(content []byte, rel string, seen map[string]struct{}, out *[]Fi
 				continue
 			}
 			if urlPrefix.MatchString(stripped) {
+				continue
+			}
+			// `import.meta.env.VITE_AUTH_PASSWORD`, `process.env.STRIPE_KEY`,
+			// `os.environ["DB_URL"]` etc. are env-var NAME reads, not values.
+			// The actual secret (if any) lives at the env-var DEFINITION
+			// in a `.env*` file, which the regex pass handles. Without this
+			// guard the env-var read trips entropy because the variable name
+			// is long + uppercase + sits next to a "password"/"key"/"token"
+			// keyword on the same line.
+			if envVarRead.MatchString(stripped) {
 				continue
 			}
 			h := shannonEntropy(stripped)
