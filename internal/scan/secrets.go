@@ -115,6 +115,15 @@ type regexPattern struct {
 var regexPatterns = []regexPattern{
 	{"AWS access key", regexp.MustCompile(`\b(AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA)[0-9A-Z]{16}\b`)},
 	{"Google API key", regexp.MustCompile(`\bAIza[0-9A-Za-z\-_]{35}\b`)},
+	// Google OAuth 2.0 client secrets follow the GOCSPX-<28-char> shape.
+	// Found in the wild during the 2026-05-31 bench sweep
+	// (ArtemXTech/claude-code-obsidian-starter shipped one bundled into
+	// a plugin's main.js).
+	{"Google OAuth client secret", regexp.MustCompile(`\bGOCSPX-[A-Za-z0-9_\-]{28}\b`)},
+	// HuggingFace user access tokens (`hf_<34+ alphanumeric>`). Bench
+	// sweep showed 3 hits in NJUxlj/Travel-Agent fine-tuning scripts;
+	// real-looking tokens in committed code.
+	{"HuggingFace token", regexp.MustCompile(`\bhf_[A-Za-z0-9]{34,}\b`)},
 	{"GitHub PAT (classic)", regexp.MustCompile(`\bgh[pousr]_[A-Za-z0-9]{36}\b`)},
 	{"GitHub fine-grained PAT", regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{82}\b`)},
 	{"Stripe secret key", regexp.MustCompile(`\bsk_(live|test)_[A-Za-z0-9]{24,}\b`)},

@@ -255,6 +255,47 @@ func TestScanSecrets_ContentHashIsStableAcrossRuns(t *testing.T) {
 	}
 }
 
+// Recall-gap closures from the 2026-05-31 cross-tool bench sweep —
+// gitleaks/trufflehog flagged real-looking tokens in repos we missed
+// because we lacked the pattern. Each new regex below has a positive
+// fixture and a negative control.
+
+func TestScanSecrets_DetectsHuggingFaceTokens(t *testing.T) {
+	// `hf_<34-or-more-alphanum>`. Built via string concat to avoid GitHub's
+	// push-protection scanner on our own commit.
+	fixture := "hf_" + strings.Repeat("aA1bB2", 6) + "xyzAB"
+	root := writeTree(t, map[string]string{
+		"finetune.py":  "HF_TOKEN = \"" + fixture + "\"\n",
+		"docs/short.md": "Use hf_short to authenticate.\n", // short → not a token
+	})
+	res, err := ScanSecrets(ScanOptions{Workdir: root})
+	if err != nil {
+		t.Fatalf("ScanSecrets: %v", err)
+	}
+	hf := findByPattern(t, res.Findings, "HuggingFace token")
+	if len(hf) != 1 {
+		t.Errorf("expected 1 HF token finding, got %d: %v", len(hf), allFiles(res.Findings))
+	}
+}
+
+func TestScanSecrets_DetectsGoogleOAuthClientSecrets(t *testing.T) {
+	// GOCSPX- + 28 alphanum/_/-. Matches the in-the-wild shape found in
+	// ArtemXTech/claude-code-obsidian-starter on 2026-05-31.
+	fixture := "GOCSPX-" + strings.Repeat("xY9", 9) + "z"
+	root := writeTree(t, map[string]string{
+		"src/oauth.ts": "const clientSecret = \"" + fixture + "\";\n",
+		"docs/intro.md": "GOCSPX-short is not a valid token shape.\n",
+	})
+	res, err := ScanSecrets(ScanOptions{Workdir: root})
+	if err != nil {
+		t.Fatalf("ScanSecrets: %v", err)
+	}
+	g := findByPattern(t, res.Findings, "Google OAuth client secret")
+	if len(g) != 1 {
+		t.Errorf("expected 1 Google OAuth finding, got %d: %v", len(g), allFiles(res.Findings))
+	}
+}
+
 // FP-audit regression tests — these cases come from the 2026-05-31 sweep of
 // 20 less-curated AI starter repos, where every single "critical" finding
 // turned out to be a false positive. See PR commit message + the
