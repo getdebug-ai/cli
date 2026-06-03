@@ -147,6 +147,26 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 			res.ScannedFiles, elapsed.Round(time.Millisecond), hint)
 	}
 
+	// AI-app regex prefilters — deterministic, no LLM call. Runs on every
+	// analyze (free, no Ollama needed). Phase 1.7 Item 1b.
+	aiStart := time.Now()
+	aiRes, aiErr := scan.ScanAiAppRegex(abs, func(format string, args ...any) {
+		if !analyzeQuiet {
+			fmt.Fprintf(cmd.ErrOrStderr(), "  "+format+"\n", args...)
+		}
+	})
+	if aiErr != nil {
+		return fmt.Errorf("ai-app regex pass: %w", aiErr)
+	}
+	if !analyzeQuiet && aiRes.FilesConsidered > 0 {
+		fmt.Fprintf(cmd.ErrOrStderr(),
+			"ai-app regex: scanned %d of %d JS/TS files in %s · %d findings\n",
+			aiRes.FilesScanned, aiRes.FilesConsidered,
+			time.Since(aiStart).Round(time.Millisecond),
+			len(aiRes.Findings))
+	}
+	res.Findings = append(res.Findings, aiRes.Findings...)
+
 	// Optional: local-LLM SAST pass via Ollama. Runs AFTER the secrets pass
 	// so the regex findings always surface, even if Ollama is down or the
 	// model errors. Findings from the model are merged into res.Findings.
@@ -187,6 +207,13 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 		res.Findings = append(res.Findings, sastRes.Findings...)
 	}
 
+	// Dedupe: when both the regex prefilter and the LLM SAST land on
+	// the same (file, line, category) triple, the regex hit wins (it
+	// has deterministic provenance + a tighter matched-span). Order-
+	// preserving so the secrets pass + regex prefilter rows stay
+	// first in the report — those are the highest-confidence findings.
+	res.Findings = dedupeFindings(res.Findings)
+
 	if analyzeSARIF != "" {
 		if err := writeSARIFFile(analyzeSARIF, res.Findings); err != nil {
 			return fmt.Errorf("write SARIF: %w", err)
@@ -215,6 +242,34 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 		return ErrCIThresholdExceeded
 	}
 	return nil
+}
+
+// dedupeFindings collapses findings that match on (filePath, lineStart,
+// category) — the case where the LLM SAST pass surfaces the same shape
+// the regex prefilter already caught. First occurrence wins, so the
+// secrets pass + regex prefilter rows (which run first) shadow any
+// later LLM duplicate. Order-preserving — the report's ranking stays
+// stable.
+func dedupeFindings(in []scan.Finding) []scan.Finding {
+	if len(in) <= 1 {
+		return in
+	}
+	type key struct {
+		filePath  string
+		lineStart int
+		category  string
+	}
+	seen := make(map[key]struct{}, len(in))
+	out := in[:0]
+	for _, f := range in {
+		k := key{filePath: f.FilePath, lineStart: f.LineStart, category: f.Category}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, f)
+	}
+	return out
 }
 
 // countAtOrAbove counts findings at or above the threshold for `--fail-on`.
