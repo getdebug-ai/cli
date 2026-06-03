@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/getdebug-ai/cli/internal/config"
+	"github.com/getdebug-ai/cli/internal/fix"
 )
 
 var (
@@ -59,7 +61,8 @@ either. The dashboard surfaces them with explanation only.`,
 func init() {
 	fixCmd.Flags().BoolVar(&fixApply, "apply", false, "write the patch to disk (default: dry-run preview)")
 	fixCmd.Flags().BoolVar(&fixInteractive, "interactive", false, "walk through pending fixes one by one (Phase 2)")
-	fixCmd.Flags().BoolVar(&fixLocalOnly, "local-only", false, "use your own Claude key, never upload (Phase 2)")
+	fixCmd.Flags().BoolVar(&fixLocalOnly, "local-only", false,
+		"scan the workdir locally and apply deterministic patches without touching getdebug servers")
 	fixCmd.Flags().BoolVar(&fixCI, "ci", false, "exit non-zero on any unfixed finding above threshold (Phase 2)")
 }
 
@@ -106,8 +109,20 @@ type fixPatchResp struct {
 }
 
 func runFix(cmd *cobra.Command, args []string) error {
-	if fixInteractive || fixLocalOnly || fixCI {
-		return errors.New("--interactive, --local-only, --ci are not yet implemented (Phase 2)")
+	if fixLocalOnly {
+		// --local-only never reaches getdebug servers — no auth, no
+		// remote fix list. Detect-then-patch the workdir in place,
+		// scoped to the deterministic patcher set.
+		if fixInteractive || fixCI {
+			return errors.New("--interactive and --ci are not yet supported alongside --local-only")
+		}
+		if len(args) > 0 {
+			return errors.New("`getdebug fix --local-only` operates on the workdir; remove the fix-id argument")
+		}
+		return runFixLocalOnly(cmd)
+	}
+	if fixInteractive || fixCI {
+		return errors.New("--interactive, --ci are not yet implemented (Phase 2)")
 	}
 	cfg, err := config.Load()
 	if err != nil {
@@ -452,6 +467,105 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	return out.Close()
+}
+
+// ─── --local-only flow ───────────────────────────────────────────
+//
+// Runs entirely off-line: scan the workdir for pattern shapes a
+// deterministic patcher can fix, then either preview (dry-run) or
+// apply with a timestamped backup directory. No HTTP, no auth, no
+// data leaves the laptop. Mirrors the WEDGE claim "free, dev-led
+// tool that opens the fix as a [reversible patch]" on the local
+// path — the hosted-path PR creation has no analogue locally because
+// a local-only org has no upstream to PR against.
+
+func runFixLocalOnly(cmd *cobra.Command) error {
+	root, err := gitRepoRoot()
+	if err != nil {
+		// We don't STRICTLY need a git repo for local-only fix
+		// (unlike --apply on a hosted fix, which uses `git apply`).
+		// But the backup-directory idiom and the dev's mental model
+		// both assume "this is my repo's working tree." Fall back to
+		// the process cwd with a warning.
+		cwd, cwdErr := os.Getwd()
+		if cwdErr != nil {
+			return fmt.Errorf("can't resolve a workdir: %w", cwdErr)
+		}
+		cmd.PrintErrln("Note: not inside a git repository — using current directory as the workdir.")
+		root = cwd
+	}
+
+	cmd.PrintErrf("fix --local-only: scanning %s for deterministic-fix patterns...\n", root)
+	stderr := cmd.ErrOrStderr()
+	res, err := fix.Run(fix.EngineOptions{
+		Workdir: root,
+		DryRun:  !fixApply,
+		Logf: func(format string, args ...any) {
+			fmt.Fprintf(stderr, "  "+format+"\n", args...)
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("fix --local-only: %w", err)
+	}
+
+	if len(res.Outcomes) == 0 {
+		cmd.Println("No fixable patterns detected. Nothing to do.")
+		return nil
+	}
+
+	applied, declined, manual, filesTouched := res.Stats()
+
+	// Per-outcome summary, grouped by category for scannability.
+	out := cmd.OutOrStdout()
+	byCategory := map[string][]fix.ApplyOutcome{}
+	for _, o := range res.Outcomes {
+		byCategory[o.Detected.Category] = append(byCategory[o.Detected.Category], o)
+	}
+	cats := make([]string, 0, len(byCategory))
+	for c := range byCategory {
+		cats = append(cats, c)
+	}
+	sort.Strings(cats)
+	for _, c := range cats {
+		fmt.Fprintf(out, "\n%s:\n", c)
+		for _, o := range byCategory[c] {
+			status := "declined"
+			switch {
+			case o.OK:
+				status = "patched"
+			case o.ManualCommand != "":
+				status = "manual"
+			}
+			fmt.Fprintf(out, "  %s  %s:%d\n", status, o.Detected.FilePath, o.Detected.LineStart)
+			if o.OK && o.Description != "" {
+				fmt.Fprintf(out, "    → %s\n", firstLine(o.Description))
+			}
+			if !o.OK && o.Reason != "" {
+				fmt.Fprintf(out, "    reason: %s\n", o.Reason)
+			}
+			if o.ManualCommand != "" {
+				fmt.Fprintf(out, "    run: %s\n", o.ManualCommand)
+			}
+		}
+	}
+
+	if fixApply {
+		fmt.Fprintf(out, "\nApplied %d patch(es) across %d file(s). Backup: %s\n",
+			applied, filesTouched, res.BackupDir)
+		fmt.Fprintln(out, "Restore with: getdebug undo")
+	} else {
+		fmt.Fprintf(out, "\nDry run. %d would be patched, %d declined, %d need a manual command.\n",
+			applied, declined, manual)
+		fmt.Fprintln(out, "Re-run with --apply to write to disk.")
+	}
+	return nil
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 // printPatch ANSI-colors added/removed lines so the diff is scannable in
