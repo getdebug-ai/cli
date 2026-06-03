@@ -10,7 +10,7 @@ import (
 // If a category is added to sastCategories and forgotten in the prompt
 // (or vice versa via accidental hand-edit), this test catches it.
 func TestSastLocalSystemPromptIncludesAllCategories(t *testing.T) {
-	prompt := sastLocalSystemPrompt()
+	prompt := sastLocalSystemPrompt(suppressionContext{})
 	for _, c := range sastCategories {
 		if !strings.Contains(prompt, c.name) {
 			t.Errorf("system prompt missing category name: %s", c.name)
@@ -75,7 +75,7 @@ func TestSastCategoryLookupMatchesSlice(t *testing.T) {
 // attack surface. This test fails loudly if either happens. See
 // /cso security audit 2026-06-03 Finding #1.
 func TestSastLocalSystemPromptHasTrustBoundary(t *testing.T) {
-	prompt := sastLocalSystemPrompt()
+	prompt := sastLocalSystemPrompt(suppressionContext{})
 	mustContain := []string{
 		"CRITICAL — TRUST BOUNDARY",
 		"UNTRUSTED INPUT from a third-party repository",
