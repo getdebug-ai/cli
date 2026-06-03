@@ -46,17 +46,21 @@ var analyzeCmd = &cobra.Command{
 	Use:   "analyze [path]",
 	Short: "Scan a directory for security findings",
 	Long: `Walks the given path (default: current directory) and runs getdebug's
-local detectors. v1 ships the secrets detector — regex + entropy — which
+local detectors. The secrets pass (regex + entropy) always runs — it
 catches the highest-severity launch blockers (AWS / GitHub / Stripe / OpenAI
 keys, private key blocks, high-entropy strings near credential keywords).
 
-Cross-file SAST and the LLM-app pattern catalog require uploading to the
-getdebug API, which is on the roadmap and not yet wired into this CLI.
-
 With --local-llm an AI-based SAST pass runs against a LOCAL Ollama chat
 model (Qwen, DeepSeek, Llama, …) so code never leaves the laptop and you
-pay nothing per scan. Install Ollama (https://ollama.ai) and pull a model
-first: 'ollama pull qwen2.5-coder:7b'. Use --local-llm-model to override.
+pay nothing per scan. Coverage: 12 traditional SAST categories
+(sql-injection, command-injection, path-traversal, xss, ssrf,
+insecure-deserialize, weak-crypto, insecure-random, missing-auth,
+broken-access, open-redirect, insecure-cors) AND 6 AI-app categories
+(prompt-injection, unsafe-tool-output, pii-in-prompt, unsafe-role-merge,
+client-side-llm-key, unbounded-stream).
+
+Install Ollama (https://ollama.ai) and pull a model first:
+'ollama pull qwen2.5-coder:7b'. Use --local-llm-model to override.
 
 Exit codes:
   0  no findings, or findings below the --fail-on threshold
