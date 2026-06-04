@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.3.0 — 2026-06-04
+
+Closes the local-vs-hosted parity gap that made dogfooding `analyze .`
+on a working codebase produce noisy results — gitignored files
+(scan-result caches, .env.local, tooling artifacts) were being walked
+even though the hosted scan correctly never sees them. Also lands 4
+more AI-app regex prefilter categories, taking default-scan recall
+from 25% to 75% on the published bench corpus.
+
+### Added
+- **`.gitignore` respected by default**, including nested `.gitignore`
+  files anywhere under the workdir. Each `.gitignore`'s rules are
+  scoped to its directory (matches git's own semantics), so a
+  `results/` rule inside `bench/.gitignore` only excludes paths under
+  `bench/`. On the getdebug repo this drops a 549-finding self-scan
+  down to 65 — closing the gap with the hosted scan's 95 (the
+  remaining delta is the LLM SAST pass that's hosted-only).
+- **`.getdebug-ignore`** — a scanner-specific overlay using standard
+  gitignore syntax. Always applied (the `--no-gitignore` flag below
+  doesn't disable it), so it's the right place for "skip this tracked
+  file" (e.g. `**/*.test.ts`) or "re-include this gitignored file"
+  (with a `!pattern` line).
+- **4 new AI-app regex prefilter categories** on every default scan
+  (no Ollama needed):
+    - `pii-in-prompt` (CWE-359, high) — `JSON.stringify(<user-shape>)`
+      where the variable name is in a curated allowlist
+      (user/profile/account/...) AND an LLM-call marker is within ±20
+      lines. Skips locally-built reduction vars like `safeContext`.
+    - `unsafe-role-merge` (CWE-1039, high) — `role: "system"` message
+      whose content is a template literal with `${}` interpolation.
+      Object-scoped lookahead via a brace-tracking helper so a static
+      system role followed by an interpolated user role doesn't
+      falsely fire.
+    - `prompt-injection` (CWE-77, high) — a variable named prompt /
+      fullPrompt / systemPrompt / etc. assigned a literal + identifier
+      concatenation. Multi-line via `(?s)`. Ignores constant
+      `SYSTEM_PROMPT` assignments and unrelated path-style concat.
+    - `unsafe-tool-output` (CWE-78, critical) — exec/spawn/run/eval
+      sink called with a tool-output reference as its arg
+      (`tool.input.*`, `block.input.*`, `toolUse.input.*`, etc.). The
+      allowlist-then-run safe pattern stays clean because the sink
+      arg is a static const.
+- **`--no-gitignore` flag** on `analyze` for the rare case someone
+  wants to scan everything on disk regardless of gitignore rules.
+  `.getdebug-ignore` still applies in this mode.
+
+### Changed
+- **String-literal-aware comment skip in the AI-app regex pass**:
+  matches inside test-description strings like
+  `it("flags role: 'system' ...", ...)` no longer fire. Walks back
+  through the line counting unescaped quote toggles.
+
+### Bench corpus (published at https://www.getdebug.dev/bench)
+
+```
+                  TP  FP  FN  Precision  Recall
+getdebug          6   5   2   0.55       0.75   ← was 0.55 / 0.25 on v0.2.0
+gitleaks          2   1   6   0.67       0.25
+trufflehog        0   0   8   0          0
+```
+
+The 3× recall improvement comes entirely from the 4 new regex
+prefilters; precision is unchanged. Note: gitleaks + trufflehog are
+secret-scanners and don't claim coverage on AI-app behavioral
+categories — included as the secret-shape baseline only.
+
 ## 0.2.0 — 2026-06-03
 
 Phase 1.7 — closes the WEDGE positioning gaps with three substantial
