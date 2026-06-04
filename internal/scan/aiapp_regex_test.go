@@ -181,7 +181,7 @@ func TestScanAiAppRegexWalksAndAggregates(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := ScanAiAppRegex(tmp, nil)
+	res, err := ScanAiAppRegex(tmp, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

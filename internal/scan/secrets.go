@@ -264,6 +264,11 @@ type ScanOptions struct {
 	Workdir string
 	// Ignore is a set of relative paths to skip (forward-slash form).
 	Ignore map[string]struct{}
+	// IgnoreRules applies .gitignore + .getdebug-ignore patterns.
+	// Nil means "no additional rules" — only the built-in skipDirs +
+	// the per-path Ignore set above are honored. Loaded by
+	// LoadIgnoreRules at the analyze command level.
+	IgnoreRules *IgnoreRuleset
 }
 
 // Result is what ScanSecrets returns.
@@ -282,7 +287,7 @@ type Result struct {
 func ScanSecrets(opts ScanOptions) (*Result, error) {
 	res := &Result{}
 	seen := make(map[string]struct{})
-	if err := walkDir(opts.Workdir, opts.Workdir, opts.Ignore, seen, res); err != nil {
+	if err := walkDir(opts.Workdir, opts.Workdir, opts.Ignore, opts.IgnoreRules, seen, res); err != nil {
 		return res, err
 	}
 	return res, nil
@@ -291,7 +296,7 @@ func ScanSecrets(opts ScanOptions) (*Result, error) {
 // walkDir returns filepath.SkipAll when the cumulative byte budget is hit.
 // Other errors are non-fatal: directories that can't be read are skipped,
 // matching the TS implementation's posture.
-func walkDir(root, dir string, ignore map[string]struct{}, seen map[string]struct{}, res *Result) error {
+func walkDir(root, dir string, ignore map[string]struct{}, rules *IgnoreRuleset, seen map[string]struct{}, res *Result) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil // unreadable dir: skip, don't fail the whole scan
@@ -313,7 +318,16 @@ func walkDir(root, dir string, ignore map[string]struct{}, seen map[string]struc
 			if _, skip := skipDirs[name]; skip {
 				continue
 			}
-			if err := walkDir(root, abs, ignore, seen, res); err != nil {
+			// .gitignore + .getdebug-ignore directory check. If the dir
+			// itself is ignored we skip the whole subtree without ever
+			// reading its contents — same shape skipDirs uses.
+			if rules != nil {
+				relDir, relErr := filepath.Rel(root, abs)
+				if relErr == nil && rules.IsDirIgnored(filepath.ToSlash(relDir)) {
+					continue
+				}
+			}
+			if err := walkDir(root, abs, ignore, rules, seen, res); err != nil {
 				return err
 			}
 			continue
@@ -339,6 +353,9 @@ func walkDir(root, dir string, ignore map[string]struct{}, seen map[string]struc
 		}
 		rel = filepath.ToSlash(rel)
 		if _, skip := ignore[rel]; skip {
+			continue
+		}
+		if rules != nil && rules.IsIgnored(rel) {
 			continue
 		}
 

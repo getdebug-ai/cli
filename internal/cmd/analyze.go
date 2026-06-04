@@ -15,6 +15,7 @@ import (
 )
 
 var (
+	analyzeNoGitignore  bool
 	analyzeWatch        bool
 	analyzeCI           bool
 	analyzeFailOn       string
@@ -87,6 +88,8 @@ Examples:
 }
 
 func init() {
+	analyzeCmd.Flags().BoolVar(&analyzeNoGitignore, "no-gitignore", false,
+		"scan files even when they match .gitignore (default: respect .gitignore, matching the hosted scan)")
 	analyzeCmd.Flags().BoolVar(&analyzeWatch, "watch", false, "re-analyze on file changes (Phase 2 — not yet implemented)")
 	analyzeCmd.Flags().BoolVar(&analyzeCI, "ci", false, "exit non-zero on findings at or above --fail-on threshold")
 	analyzeCmd.Flags().StringVar(&analyzeFailOn, "fail-on", "high", "minimum severity that fails the build under --ci: critical|high|medium|low|any")
@@ -128,8 +131,20 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 	if !analyzeQuiet {
 		fmt.Fprintf(cmd.ErrOrStderr(), "getdebug %s — scanning %s\n", version, abs)
 	}
+
+	// Ignore rules: .gitignore (respected by default) + .getdebug-ignore
+	// (always applied). Loaded once at the workdir root and shared by
+	// all three scan passes — matches the hosted-scan behaviour, which
+	// only sees committed files because it clones from the git remote.
+	ignoreLog := func(format string, args ...any) {
+		if !analyzeQuiet {
+			fmt.Fprintf(cmd.ErrOrStderr(), "  "+format+"\n", args...)
+		}
+	}
+	rules := scan.LoadIgnoreRules(abs, !analyzeNoGitignore, ignoreLog)
+
 	start := time.Now()
-	res, err := scan.ScanSecrets(scan.ScanOptions{Workdir: abs})
+	res, err := scan.ScanSecrets(scan.ScanOptions{Workdir: abs, IgnoreRules: rules})
 	if err != nil {
 		// Truly fatal — partial walks never bubble here (the walker swallows
 		// per-file errors), so reaching this branch means we couldn't open
@@ -150,7 +165,7 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 	// AI-app regex prefilters — deterministic, no LLM call. Runs on every
 	// analyze (free, no Ollama needed). Phase 1.7 Item 1b.
 	aiStart := time.Now()
-	aiRes, aiErr := scan.ScanAiAppRegex(abs, func(format string, args ...any) {
+	aiRes, aiErr := scan.ScanAiAppRegex(abs, rules, func(format string, args ...any) {
 		if !analyzeQuiet {
 			fmt.Fprintf(cmd.ErrOrStderr(), "  "+format+"\n", args...)
 		}
@@ -184,10 +199,11 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 		}
 		sastStart := time.Now()
 		sastRes, sastErr := scan.ScanSastLocal(cmd.Context(), scan.SastLocalOptions{
-			Workdir:  abs,
-			Client:   client,
-			Model:    model,
-			MaxFiles: analyzeLocalLLMMax,
+			Workdir:     abs,
+			Client:      client,
+			Model:       model,
+			MaxFiles:    analyzeLocalLLMMax,
+			IgnoreRules: rules,
 			Logf: func(format string, args ...any) {
 				if !analyzeQuiet {
 					fmt.Fprintf(cmd.ErrOrStderr(), "  "+format, args...)

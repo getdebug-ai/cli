@@ -148,7 +148,7 @@ type AiAppRegexResult struct {
 // the same vendor + lockfile skips, so a clean analyze run never
 // double-walks. Best-effort: read errors are logged via logf and the
 // walk continues.
-func ScanAiAppRegex(workdir string, logf func(format string, args ...any)) (*AiAppRegexResult, error) {
+func ScanAiAppRegex(workdir string, rules *IgnoreRuleset, logf func(format string, args ...any)) (*AiAppRegexResult, error) {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
@@ -165,6 +165,12 @@ func ScanAiAppRegex(workdir string, logf func(format string, args ...any)) (*AiA
 			if strings.HasPrefix(d.Name(), ".getdebug-backup-") {
 				return filepath.SkipDir
 			}
+			if rules != nil {
+				relDir, relErr := filepath.Rel(workdir, path)
+				if relErr == nil && rules.IsDirIgnored(filepath.ToSlash(relDir)) {
+					return filepath.SkipDir
+				}
+			}
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(d.Name()))
@@ -172,6 +178,14 @@ func ScanAiAppRegex(workdir string, logf func(format string, args ...any)) (*AiA
 		case ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs":
 			// supported
 		default:
+			return nil
+		}
+		rel, err := filepath.Rel(workdir, path)
+		if err != nil {
+			rel = path
+		}
+		rel = filepath.ToSlash(rel)
+		if rules != nil && rules.IsIgnored(rel) {
 			return nil
 		}
 		res.FilesConsidered++
@@ -192,11 +206,6 @@ func ScanAiAppRegex(workdir string, logf func(format string, args ...any)) (*AiA
 			logf("ai-app regex: read %s: %v — skipping", path, err)
 			return nil
 		}
-		rel, err := filepath.Rel(workdir, path)
-		if err != nil {
-			rel = path
-		}
-		rel = filepath.ToSlash(rel)
 		res.FilesScanned++
 		res.Findings = append(res.Findings, scanAiAppRegex(rel, string(raw))...)
 		return nil

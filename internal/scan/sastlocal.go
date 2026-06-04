@@ -52,6 +52,9 @@ type SastLocalOptions struct {
 	Workdir string
 	Client  *localllm.Client
 	Model   string
+	// IgnoreRules applies .gitignore + .getdebug-ignore patterns. Same
+	// semantic as the secrets + ai-app passes — nil means "no rules."
+	IgnoreRules *IgnoreRuleset
 	// MaxFiles caps the per-scan call count. Local 7B models on CPU run
 	// 30s–5min per file; without this, a 500-file repo could pin the
 	// laptop for hours. Default 50.
@@ -281,6 +284,12 @@ func ScanSastLocal(ctx context.Context, opts SastLocalOptions) (*SastLocalResult
 			if _, skip := skipDirs[name]; skip {
 				return filepath.SkipDir
 			}
+			if opts.IgnoreRules != nil {
+				relDir, relErr := filepath.Rel(opts.Workdir, path)
+				if relErr == nil && opts.IgnoreRules.IsDirIgnored(filepath.ToSlash(relDir)) {
+					return filepath.SkipDir
+				}
+			}
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(path))
@@ -291,6 +300,9 @@ func ScanSastLocal(ctx context.Context, opts SastLocalOptions) (*SastLocalResult
 		// Mirror the secrets pass: skip tests + test-dirs (high false-fire
 		// rate, the model wastes calls).
 		if testFile.MatchString(rel) || testDir.MatchString(rel) {
+			return nil
+		}
+		if opts.IgnoreRules != nil && opts.IgnoreRules.IsIgnored(filepath.ToSlash(rel)) {
 			return nil
 		}
 		res.FilesConsidered++
