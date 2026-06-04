@@ -51,7 +51,7 @@ The launch slice — what works **today, offline, with no account**:
 Not in v0.1.0: `login`, `fix`, `status`, `undo` (stubs — these require
 hosted API integration, coming next). Cross-file SAST, dependency CVE
 checks, and the LLM-app prompt-injection detector live on the hosted side
-and are surfaced via the dashboard at [getdebug.ai](https://getdebug.ai).
+and are surfaced via the dashboard at [getdebug.dev](https://getdebug.dev).
 
 ## Install
 

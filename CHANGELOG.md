@@ -195,7 +195,7 @@ First public release of the getdebug CLI.
 - `login`, `fix`, `status`, `undo` commands are stubs (require hosted API
   integration — coming next).
 - No cross-file SAST or dependency CVE scanning yet (those live on the
-  hosted side and are surfaced via [getdebug.ai](https://getdebug.ai)).
+  hosted side and are surfaced via [getdebug.dev](https://getdebug.dev)).
 - Running `getdebug analyze .` on this repo returns 0 findings — test
   fixtures use string-concatenation (`"AKIA" + "IOSFODNN7EXAMPLE"`) so
   contiguous token shapes never appear in source. Same trick keeps
