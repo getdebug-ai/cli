@@ -35,12 +35,16 @@ import (
 	"strings"
 )
 
-// Severity floors for the two categories. Mirror the hosted defaults
+// Severity floors for the six categories. Mirror the hosted defaults
 // from workers/src/security/llm-app.ts. The CLI's sastlocal pass has
 // its own floor enforcement; this surface keeps the same contract.
 const (
-	clientLlmKeySeverity   = SeverityCritical
+	clientLlmKeySeverity    = SeverityCritical
 	unboundedStreamSeverity = SeverityMedium
+	piiInPromptSeverity     = SeverityHigh
+	unsafeRoleMergeSeverity = SeverityHigh
+	promptInjectionSeverity = SeverityHigh
+	unsafeToolOutputSeverity = SeverityCritical
 )
 
 // Same provider-name list the hosted side uses — narrow + capitalised
@@ -60,6 +64,72 @@ var decoderDecodeLookbackRe = regexp.MustCompile(`\.decode\s*\([^)]*$`)
 // AbortController / signal: / .abort( in the surrounding window means
 // the stream is bounded already. Skip.
 var abortInScopeRe = regexp.MustCompile(`\b(?:AbortController|signal\s*:|\.abort\s*\()`)
+
+// ── pii-in-prompt prefilter ──────────────────────────────────────
+//
+// Detects a high-signal anti-pattern: an entire user-shape object is
+// JSON.stringify'd into an LLM message. The bench's vulnerable fixture
+// uses `JSON.stringify(user)`; the safe variant builds a small
+// `safeContext` first. We fire only on the curated user-shape names
+// to keep precision high. A JSON.stringify(arbitraryVar) doesn't
+// match — there are too many legitimate callers.
+var piiInPromptRe = regexp.MustCompile(
+	`\bJSON\.stringify\s*\(\s*(user|profile|account|customer|member|currentUser|loggedInUser|userInfo|userData|userProfile|userRecord|userObject|personalInfo|personalDetails)\b`,
+)
+
+// LLM-call markers within the ±20-line context window. The same
+// JSON.stringify shape outside an LLM call is e.g. a server log or a
+// REST response — not in scope.
+var llmCallContextRe = regexp.MustCompile(
+	`(?:messages\s*:|chat\.completions\.create|messages\.create|generateContent|complete\s*\(|\.invoke\s*\(|prompt\s*:)`,
+)
+
+// ── unsafe-role-merge prefilter ──────────────────────────────────
+//
+// A `role: "system"` message whose `content` is a template literal
+// containing `${...}` interpolation. The safe pattern uses static
+// strings or constants for system content; user-controlled text rides
+// the user-role channel.
+//
+// We match a `role: "system"` marker, then look ahead up to 240 chars
+// in the same message-object for a content field that's a template
+// literal carrying a `${}` interpolation.
+var systemRoleMarkerRe = regexp.MustCompile(`\brole\s*:\s*["']system["']`)
+var contentInterpolatedRe = regexp.MustCompile("content\\s*:\\s*`[^`]*\\$\\{[^}]+\\}[^`]*`")
+
+// ── prompt-injection prefilter ───────────────────────────────────
+//
+// Detects the assignment form: a `prompt`-shaped variable assigned a
+// string literal concatenated with an identifier (likely user input).
+// The safe pattern keeps system instructions in a const and routes
+// user input through the user-role channel.
+//
+// Multi-line concat needs (?s) so `.` spans newlines. The fixture
+// concatenates across three lines:
+//   const prompt =
+//     "You are a translator. ..." +
+//     userQuestion;
+var promptConcatRe = regexp.MustCompile(
+	`(?s)(?:const|let|var)\s+(?:prompt|fullPrompt|systemPrompt|userPrompt|finalPrompt|completePrompt|combinedPrompt|message|query)\b\s*=\s*"[^"]*"\s*\+\s*[a-zA-Z_$]`,
+)
+
+// ── unsafe-tool-output prefilter ─────────────────────────────────
+//
+// A shell/exec sink called with a tool-output reference as its first
+// argument. The Anthropic + OpenAI SDKs surface tool output as
+// `block.input.<field>`, `tool.input.<field>`, `toolUse.input.<field>`,
+// `toolCall.arguments.<field>`. The safe pattern routes that field
+// through an allowlist before calling the shell.
+//
+// Sinks: exec / execSync / spawn / spawnSync / eval / Function() +
+// promisified-exec wrappers commonly named `run`. We deliberately
+// include `run` because the bench fixture uses
+// `run = promisify(exec)` — the same name a hand-rolled wrapper would
+// take. Tightened by the must-reference-tool-input requirement so
+// `run("ls")` doesn't fire.
+var unsafeToolOutputRe = regexp.MustCompile(
+	`\b(?:exec|execSync|spawn|spawnSync|eval|run|runCommand|runSync)\s*\(\s*[^)]*?\b(?:tool|toolUse|toolCall|block|toolResult|toolOutput|message|response)\.(?:input|arguments|args|parameters|result|content)\.`,
+)
 
 // AiAppRegexResult mirrors the existing scan-pass return shapes so the
 // CLI's analyze command can emit honest coverage numbers (files
@@ -137,12 +207,16 @@ func ScanAiAppRegex(workdir string, logf func(format string, args ...any)) (*AiA
 	return res, nil
 }
 
-// scanAiAppRegex applies both prefilters to one file's source. Split
+// scanAiAppRegex applies every prefilter to one file's source. Split
 // out so unit tests can exercise the regexes without a workdir walk.
 func scanAiAppRegex(relPath, source string) []Finding {
 	var out []Finding
 	out = append(out, scanClientSideLlmKey(relPath, source)...)
 	out = append(out, scanUnboundedStream(relPath, source)...)
+	out = append(out, scanPiiInPrompt(relPath, source)...)
+	out = append(out, scanUnsafeRoleMerge(relPath, source)...)
+	out = append(out, scanPromptInjection(relPath, source)...)
+	out = append(out, scanUnsafeToolOutput(relPath, source)...)
 	return out
 }
 
@@ -233,6 +307,257 @@ func scanUnboundedStream(relPath, source string) []Finding {
 	return out
 }
 
+// scanPiiInPrompt fires when an entire user-shape object is
+// JSON.stringify'd into an LLM message. Requires both the curated
+// user-name match AND an LLM-call marker within ±20 lines to keep
+// FPs out of server-log call sites.
+func scanPiiInPrompt(relPath, source string) []Finding {
+	var out []Finding
+	lines := strings.Split(source, "\n")
+	for _, loc := range piiInPromptRe.FindAllStringSubmatchIndex(source, -1) {
+		matchStart := loc[0]
+		if inNonCodeContext(source, matchStart) {
+			continue
+		}
+		line := lineNumberAt(source, matchStart)
+		// ±20 line window for LLM-call context.
+		from := line - 1 - 20
+		if from < 0 {
+			from = 0
+		}
+		to := line + 20
+		if to > len(lines) {
+			to = len(lines)
+		}
+		window := strings.Join(lines[from:to], "\n")
+		if !llmCallContextRe.MatchString(window) {
+			continue
+		}
+		matchedSpan := source[loc[2]:loc[3]] // capture group 1: the var name
+		out = append(out, Finding{
+			FilePath:    relPath,
+			LineStart:   line,
+			LineEnd:     line,
+			Category:    "pii-in-prompt",
+			Severity:    piiInPromptSeverity,
+			Title:       "User PII serialised into LLM prompt",
+			Explanation: "JSON.stringify on a user-shape variable inside an LLM call sends every field — email, phone, address, DOB — to the provider's logs and may end up in their retention/training pipeline. Reduce the payload to the fields the task actually needs before serialising, or pull out just the display fields at the call site.",
+			ContentHash: hashAiAppFinding(relPath, line, "pii-in-prompt", matchedSpan),
+			Snippet:     extractLine(source, line),
+			CWE:         "CWE-359",
+			OWASP:       "A04",
+			Detection:   "regex",
+		})
+	}
+	return out
+}
+
+// scanUnsafeRoleMerge fires when a `role: "system"` message has a
+// template-literal `content` that interpolates a `${...}` value.
+// Catches the common AI-app smell of building system instructions
+// out of user-controlled strings.
+//
+// The lookahead is bounded by the message-object's closing `}` so a
+// system-role message with a STATIC content followed by a user-role
+// message with an interpolated content doesn't falsely fire — the
+// scan stops before reaching the next message in the array.
+func scanUnsafeRoleMerge(relPath, source string) []Finding {
+	var out []Finding
+	for _, loc := range systemRoleMarkerRe.FindAllStringIndex(source, -1) {
+		pos := loc[0]
+		if inNonCodeContext(source, pos) {
+			continue
+		}
+		// Walk forward from end-of-`role:"system"` to the matching `}`
+		// that closes the surrounding message object, tracking brace
+		// depth so nested object/template-literal braces don't trick
+		// the boundary. Cap at 600 chars — well past any reasonable
+		// single message but short enough to bail on malformed source.
+		objectEnd := findObjectEnd(source, loc[1], 600)
+		if objectEnd <= loc[1] {
+			continue
+		}
+		window := source[loc[1]:objectEnd]
+		ileft := contentInterpolatedRe.FindStringIndex(window)
+		if ileft == nil {
+			continue
+		}
+		matchAbs := loc[1] + ileft[0]
+		line := lineNumberAt(source, matchAbs)
+		matchedSpan := window[ileft[0]:ileft[1]]
+		out = append(out, Finding{
+			FilePath:    relPath,
+			LineStart:   line,
+			LineEnd:     line,
+			Category:    "unsafe-role-merge",
+			Severity:    unsafeRoleMergeSeverity,
+			Title:       "User-controlled string interpolated into system role",
+			Explanation: "A `role: \"system\"` message contains template-literal interpolation, suggesting user-controlled values are reaching the system channel. Models treat the system role with operator-level authority — letting untrusted text in there bypasses much of the safety training and prompt-injection mitigations. Keep system content static; route variable inputs through the user role.",
+			ContentHash: hashAiAppFinding(relPath, line, "unsafe-role-merge", matchedSpan),
+			Snippet:     extractLine(source, line),
+			CWE:         "CWE-1039",
+			OWASP:       "A04",
+			Detection:   "regex",
+		})
+	}
+	return out
+}
+
+// findObjectEnd returns the index of the `}` that closes the object
+// containing position `start`. We assume `start` is inside an object
+// literal (after `role: "system"` which is necessarily inside one).
+// Tracks brace depth, ignoring braces that appear inside string or
+// template-literal tokens. Returns `start` (caller bails) when no
+// matching close is found within `maxScan` chars.
+func findObjectEnd(source string, start, maxScan int) int {
+	end := start + maxScan
+	if end > len(source) {
+		end = len(source)
+	}
+	depth := 1 // we're already inside the object containing `role: "system"`
+	i := start
+	for i < end {
+		c := source[i]
+		switch c {
+		case '"', '\'':
+			i = skipString(source, i, c, end)
+			continue
+		case '`':
+			i = skipTemplate(source, i, end)
+			continue
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+		i++
+	}
+	return start
+}
+
+// skipString moves past a single- or double-quoted string starting at
+// `i` (where source[i] == quote). Handles backslash escapes. Returns
+// the index AFTER the closing quote, or `end` if unterminated.
+func skipString(source string, i int, quote byte, end int) int {
+	i++ // consume opening quote
+	for i < end {
+		c := source[i]
+		if c == '\\' && i+1 < end {
+			i += 2
+			continue
+		}
+		if c == quote {
+			return i + 1
+		}
+		i++
+	}
+	return end
+}
+
+// skipTemplate moves past a backtick template literal starting at `i`.
+// Honours nested `${...}` interpolations (which themselves can contain
+// template literals) by counting brace depth inside `${...}`.
+func skipTemplate(source string, i int, end int) int {
+	i++ // consume opening backtick
+	for i < end {
+		c := source[i]
+		if c == '\\' && i+1 < end {
+			i += 2
+			continue
+		}
+		if c == '`' {
+			return i + 1
+		}
+		if c == '$' && i+1 < end && source[i+1] == '{' {
+			// Walk to the matching '}' for the interpolation expression.
+			d := 1
+			i += 2
+			for i < end && d > 0 {
+				switch source[i] {
+				case '"', '\'':
+					i = skipString(source, i, source[i], end)
+					continue
+				case '`':
+					i = skipTemplate(source, i, end)
+					continue
+				case '{':
+					d++
+				case '}':
+					d--
+				}
+				i++
+			}
+			continue
+		}
+		i++
+	}
+	return end
+}
+
+// scanPromptInjection fires on the string-concat-into-prompt anti-
+// pattern: `const prompt = "..." + userQuestion;`. Heuristic — false
+// negatives are acceptable (the LLM pass picks them up) but we
+// shouldn't fire on a SYSTEM_PROMPT constant.
+func scanPromptInjection(relPath, source string) []Finding {
+	var out []Finding
+	for _, loc := range promptConcatRe.FindAllStringIndex(source, -1) {
+		matchStart := loc[0]
+		if inNonCodeContext(source, matchStart) {
+			continue
+		}
+		line := lineNumberAt(source, matchStart)
+		matchedSpan := source[loc[0]:loc[1]]
+		out = append(out, Finding{
+			FilePath:    relPath,
+			LineStart:   line,
+			LineEnd:     line,
+			Category:    "prompt-injection",
+			Severity:    promptInjectionSeverity,
+			Title:       "User input concatenated into LLM prompt",
+			Explanation: "A prompt-shaped variable is being built by concatenating a string literal with a value that almost certainly came from the caller. The model has no structural way to distinguish your instruction from the user's content — they're both just text. Keep the instruction in the system-role message and put untrusted input in a separate user-role message.",
+			ContentHash: hashAiAppFinding(relPath, line, "prompt-injection", matchedSpan),
+			Snippet:     extractLine(source, line),
+			CWE:         "CWE-77",
+			OWASP:       "A03",
+			Detection:   "regex",
+		})
+	}
+	return out
+}
+
+// scanUnsafeToolOutput fires on a shell/exec sink whose first arg
+// references an LLM tool-output field. The safe variant routes the
+// tool field through an allowlist before reaching the sink.
+func scanUnsafeToolOutput(relPath, source string) []Finding {
+	var out []Finding
+	for _, loc := range unsafeToolOutputRe.FindAllStringIndex(source, -1) {
+		matchStart := loc[0]
+		if inNonCodeContext(source, matchStart) {
+			continue
+		}
+		line := lineNumberAt(source, matchStart)
+		matchedSpan := source[loc[0]:loc[1]]
+		out = append(out, Finding{
+			FilePath:    relPath,
+			LineStart:   line,
+			LineEnd:     line,
+			Category:    "unsafe-tool-output",
+			Severity:    unsafeToolOutputSeverity,
+			Title:       "LLM tool output flows directly into shell sink",
+			Explanation: "A shell or eval sink is being called with a value that came from an LLM tool call (tool.input.*, block.input.*, etc.). An attacker who controls the model output via prompt injection upstream gets arbitrary command execution on the host. Route the tool field through a fixed allowlist (tag → vetted command) before any shell/eval call.",
+			ContentHash: hashAiAppFinding(relPath, line, "unsafe-tool-output", matchedSpan),
+			Snippet:     extractLine(source, line),
+			CWE:         "CWE-78",
+			OWASP:       "A03",
+			Detection:   "regex",
+		})
+	}
+	return out
+}
+
 // ── Helpers (ported from workers/src/security/llm-app.ts) ────────
 
 // lineNumberAt returns the 1-based line containing position pos. O(pos)
@@ -247,7 +572,15 @@ func lineNumberAt(source string, pos int) int {
 // inNonCodeContext is true when the match sits inside a comment or a
 // string literal — same shape as the hosted helper. Filters the doc-
 // example + changelog + JSDoc false positives the hosted side already
-// learned about.
+// learned about, plus matches embedded inside test-description strings
+// (`it("flags role: 'system' ...", ...)`).
+//
+// Walks back from `pos` to the start of the line counting unescaped
+// quote toggles. If at `pos` we're inside an unterminated `"...` or
+// `'...` quote on this line, treat as non-code. Template-literal `\``
+// is handled by the adjacent-char check (the common case is matches
+// at the start of a template body) and by callers that explicitly
+// pre-filter `\`\`\` doc blocks at the source level.
 func inNonCodeContext(source string, pos int) bool {
 	if pos < 0 || pos > len(source) {
 		return false
@@ -261,7 +594,30 @@ func inNonCodeContext(source string, pos int) bool {
 		return false
 	}
 	prev := source[pos-1]
-	return prev == '"' || prev == '\'' || prev == '`'
+	if prev == '"' || prev == '\'' || prev == '`' {
+		return true
+	}
+	// Walk back to lineStart, counting unescaped " and ' opens. Either
+	// count odd → match sits inside a string literal on this line.
+	var dq, sq int
+	for i := lineStart; i < pos; i++ {
+		c := source[i]
+		if c == '\\' && i+1 < pos {
+			i++ // skip the escaped char
+			continue
+		}
+		switch c {
+		case '"':
+			if sq%2 == 0 { // only counts if not inside a single-quoted string
+				dq++
+			}
+		case '\'':
+			if dq%2 == 0 {
+				sq++
+			}
+		}
+	}
+	return dq%2 == 1 || sq%2 == 1
 }
 
 func extractLine(source string, line1Based int) string {

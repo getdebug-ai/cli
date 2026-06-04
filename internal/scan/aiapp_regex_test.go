@@ -215,3 +215,187 @@ func TestHashAiAppFindingDeterministic(t *testing.T) {
 		t.Errorf("hash looks malformed: %q", a)
 	}
 }
+
+// ── pii-in-prompt prefilter ──────────────────────────────────────
+
+func TestPiiInPromptDetectsStringifyUserInsideMessages(t *testing.T) {
+	src := `
+const r = await client.chat.completions.create({
+  messages: [
+    { role: "system", content: "Summarise this customer." },
+    { role: "user", content: JSON.stringify(user) },
+  ],
+});`
+	hits := scanPiiInPrompt("app.ts", src)
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit, got %d: %+v", len(hits), hits)
+	}
+	if hits[0].Category != "pii-in-prompt" {
+		t.Errorf("category=%q want pii-in-prompt", hits[0].Category)
+	}
+	if hits[0].Severity != SeverityHigh {
+		t.Errorf("severity=%q want high", hits[0].Severity)
+	}
+	if hits[0].CWE != "CWE-359" {
+		t.Errorf("cwe=%q want CWE-359", hits[0].CWE)
+	}
+}
+
+func TestPiiInPromptDetectsProfileVar(t *testing.T) {
+	src := `messages: [{ role: "user", content: JSON.stringify(profile) }]`
+	hits := scanPiiInPrompt("app.ts", src)
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit for profile var, got %d", len(hits))
+	}
+}
+
+// Server-side log that happens to call JSON.stringify(user) outside any
+// LLM context must NOT fire — the LLM-context window check exists for
+// exactly this case.
+func TestPiiInPromptIgnoresNonLlmContext(t *testing.T) {
+	src := `function logUser(user) { console.log(JSON.stringify(user)); }`
+	hits := scanPiiInPrompt("logger.ts", src)
+	if len(hits) != 0 {
+		t.Fatalf("expected 0 hits outside LLM context, got %d", len(hits))
+	}
+}
+
+// A non-user-shape var (e.g. a locally-built safeContext) must not
+// match — the regex restricts to a curated user-name allowlist so
+// the explicit-reduction safe pattern stays clean.
+func TestPiiInPromptIgnoresSafeContextVar(t *testing.T) {
+	src := `
+const safeContext = { displayName: user.displayName, plan: user.plan };
+const r = await client.chat.completions.create({
+  messages: [{ role: "user", content: JSON.stringify(safeContext) }],
+});`
+	hits := scanPiiInPrompt("app.ts", src)
+	if len(hits) != 0 {
+		t.Fatalf("expected 0 hits on safeContext, got %d: %+v", len(hits), hits)
+	}
+}
+
+// ── unsafe-role-merge prefilter ──────────────────────────────────
+
+func TestUnsafeRoleMergeDetectsInterpolatedSystemContent(t *testing.T) {
+	src := `messages: [
+  { role: "system", content: ` + "`You are an assistant for a ${userPersona}.`" + ` },
+  { role: "user", content: q },
+]`
+	hits := scanUnsafeRoleMerge("app.ts", src)
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit, got %d: %+v", len(hits), hits)
+	}
+	if hits[0].Category != "unsafe-role-merge" {
+		t.Errorf("category=%q want unsafe-role-merge", hits[0].Category)
+	}
+}
+
+// Static system content followed by an interpolated USER role content
+// must NOT fire — this is the bench's safe fixture shape. The object-
+// scoped lookahead exists for this case.
+func TestUnsafeRoleMergeIgnoresInterpolationInOtherRole(t *testing.T) {
+	src := `messages: [
+  { role: "system", content: SYSTEM_PROMPT },
+  { role: "user", content: ` + "`I am a ${persona}. ${userQuestion}`" + ` },
+]`
+	hits := scanUnsafeRoleMerge("app.ts", src)
+	if len(hits) != 0 {
+		t.Fatalf("expected 0 hits (interpolation is on user-role), got %d: %+v", len(hits), hits)
+	}
+}
+
+// Comment-line mention shouldn't fire.
+func TestUnsafeRoleMergeSkipsComment(t *testing.T) {
+	src := `// example: { role: "system", content: ` + "`hello ${name}`" + ` }
+const x = 1;`
+	hits := scanUnsafeRoleMerge("doc.ts", src)
+	if len(hits) != 0 {
+		t.Fatalf("expected 0 hits in comment, got %d", len(hits))
+	}
+}
+
+// ── prompt-injection prefilter ───────────────────────────────────
+
+func TestPromptInjectionDetectsLiteralPlusUserInput(t *testing.T) {
+	src := `
+const prompt =
+  "You are a translator. Translate the following to French.\n\n" +
+  userQuestion;`
+	hits := scanPromptInjection("app.ts", src)
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit, got %d: %+v", len(hits), hits)
+	}
+	if hits[0].Category != "prompt-injection" {
+		t.Errorf("category=%q want prompt-injection", hits[0].Category)
+	}
+}
+
+// A SYSTEM_PROMPT constant assigned a literal alone must NOT match —
+// no concatenation, no injection vector.
+func TestPromptInjectionIgnoresConstantSystemPrompt(t *testing.T) {
+	src := `const SYSTEM_PROMPT = "You are a translator. Translate user content to French.";`
+	hits := scanPromptInjection("app.ts", src)
+	if len(hits) != 0 {
+		t.Fatalf("expected 0 hits on constant assignment, got %d", len(hits))
+	}
+}
+
+// A non-prompt-named var assigned a literal+ident shouldn't fire —
+// keeps `const path = "/api/" + projectId` quiet.
+func TestPromptInjectionIgnoresUnrelatedVarName(t *testing.T) {
+	src := `const path = "/api/" + projectId;`
+	hits := scanPromptInjection("api.ts", src)
+	if len(hits) != 0 {
+		t.Fatalf("expected 0 hits on unrelated var name, got %d", len(hits))
+	}
+}
+
+// ── unsafe-tool-output prefilter ─────────────────────────────────
+
+func TestUnsafeToolOutputDetectsExecOfToolInput(t *testing.T) {
+	src := `const { stdout } = await run(tool.input.command);`
+	hits := scanUnsafeToolOutput("app.ts", src)
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit, got %d: %+v", len(hits), hits)
+	}
+	if hits[0].Category != "unsafe-tool-output" {
+		t.Errorf("category=%q want unsafe-tool-output", hits[0].Category)
+	}
+	if hits[0].Severity != SeverityCritical {
+		t.Errorf("severity=%q want critical", hits[0].Severity)
+	}
+	if hits[0].CWE != "CWE-78" {
+		t.Errorf("cwe=%q want CWE-78", hits[0].CWE)
+	}
+}
+
+func TestUnsafeToolOutputDetectsBlockInputForm(t *testing.T) {
+	// Anthropic SDK shape — `block.input.command`.
+	src := `await execSync(block.input.command);`
+	hits := scanUnsafeToolOutput("app.ts", src)
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit for block.input.* form, got %d", len(hits))
+	}
+}
+
+// run() with a non-tool-input arg must not fire — the allowlist-then-
+// run pattern is the safe variant.
+func TestUnsafeToolOutputIgnoresAllowlistedRun(t *testing.T) {
+	src := `
+const command = ALLOWED[tool.input.tag];
+if (!command) return "(rejected)";
+const { stdout } = await run(command);`
+	hits := scanUnsafeToolOutput("app.ts", src)
+	if len(hits) != 0 {
+		t.Fatalf("expected 0 hits on allowlisted run, got %d: %+v", len(hits), hits)
+	}
+}
+
+func TestUnsafeToolOutputIgnoresExecOfStaticString(t *testing.T) {
+	src := `await exec("ls -la");`
+	hits := scanUnsafeToolOutput("app.ts", src)
+	if len(hits) != 0 {
+		t.Fatalf("expected 0 hits on static-string exec, got %d", len(hits))
+	}
+}
