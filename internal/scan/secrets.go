@@ -85,6 +85,10 @@ var generatedBasenames = map[string]struct{}{
 	"poetry.lock": {}, "uv.lock": {}, "Pipfile.lock": {},
 	"Gemfile.lock": {}, "composer.lock": {}, "Cargo.lock": {},
 	"bun.lockb": {}, ".eslintcache": {}, ".stylelintcache": {},
+	// Go lockfile — full of h1: + dependency hashes that look like
+	// high-entropy secrets to the regex pass. Never contains real
+	// credentials; safe to skip alongside the other lockfiles.
+	"go.sum": {},
 }
 
 var binaryExts = map[string]struct{}{

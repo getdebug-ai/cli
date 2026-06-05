@@ -175,8 +175,10 @@ func ScanAiAppRegex(workdir string, rules *IgnoreRuleset, logf func(format strin
 		}
 		ext := strings.ToLower(filepath.Ext(d.Name()))
 		switch ext {
-		case ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs":
-			// supported
+		case ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py":
+			// supported — JS/TS goes through the original scanners,
+			// .py through the Python-idiom scanners (dispatched in
+			// scanAiAppRegex based on the path extension).
 		default:
 			return nil
 		}
@@ -216,9 +218,24 @@ func ScanAiAppRegex(workdir string, rules *IgnoreRuleset, logf func(format strin
 	return res, nil
 }
 
-// scanAiAppRegex applies every prefilter to one file's source. Split
-// out so unit tests can exercise the regexes without a workdir walk.
+// scanAiAppRegex applies every prefilter to one file's source.
+// Dispatch by file extension: JS/TS files go through the original
+// scanners (which fire on `process.env.NEXT_PUBLIC_*` etc.), Python
+// files go through the Python-idiom scanners.
 func scanAiAppRegex(relPath, source string) []Finding {
+	switch ext := lowerExt(relPath); ext {
+	case ".py":
+		return scanAiAppRegexPython(relPath, source)
+	default:
+		return scanAiAppRegexJS(relPath, source)
+	}
+}
+
+// scanAiAppRegexJS runs the JS/TS prefilter set. Same as the
+// original combined scanner; extracted so the dispatcher above can
+// route Python to its own scanner without dead-firing JS-only
+// patterns (NEXT_PUBLIC_ etc.) on .py files.
+func scanAiAppRegexJS(relPath, source string) []Finding {
 	var out []Finding
 	out = append(out, scanClientSideLlmKey(relPath, source)...)
 	out = append(out, scanUnboundedStream(relPath, source)...)
@@ -227,6 +244,31 @@ func scanAiAppRegex(relPath, source string) []Finding {
 	out = append(out, scanPromptInjection(relPath, source)...)
 	out = append(out, scanUnsafeToolOutput(relPath, source)...)
 	return out
+}
+
+// lowerExt returns the lowercase file extension including the dot.
+// Inline because filepath.Ext + strings.ToLower at every walk step
+// shows up in profiles on large repos.
+func lowerExt(p string) string {
+	for i := len(p) - 1; i >= 0; i-- {
+		if p[i] == '/' || p[i] == '\\' {
+			return ""
+		}
+		if p[i] == '.' {
+			ext := p[i:]
+			// Manual ASCII-lower — alloc-free for common cases.
+			b := make([]byte, len(ext))
+			for j := 0; j < len(ext); j++ {
+				c := ext[j]
+				if c >= 'A' && c <= 'Z' {
+					c += 'a' - 'A'
+				}
+				b[j] = c
+			}
+			return string(b)
+		}
+	}
+	return ""
 }
 
 // scanClientSideLlmKey applies the CLIENT_SIDE_LLM_KEY prefilter from

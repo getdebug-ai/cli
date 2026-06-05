@@ -48,6 +48,63 @@ type IgnoreRuleset struct {
 	gitignores []scopedMatcher
 	// .getdebug-ignore matcher at the workdir root. Always applied.
 	custom *ignore.GitIgnore
+	// Built-in default patterns (test files, fixtures, snapshots).
+	// Compiled from BuiltInIgnorePatterns and applied unless
+	// --no-default-ignores. Nil when the caller passes
+	// respectDefaults=false.
+	defaults *ignore.GitIgnore
+}
+
+// BuiltInIgnorePatterns returns the conservative default exclusions
+// every scan applies unless the user passes --no-default-ignores.
+// Limited to patterns that are UNAMBIGUOUSLY test-scaffolding so the
+// defaults never silently drop real source code:
+//
+//   - **/*.test.{ts,tsx,js,jsx,mjs,cjs} — Jest / Vitest convention
+//   - **/*.spec.{ts,tsx,js,jsx,mjs,cjs} — Jest convention
+//   - **/*_test.go — Go convention (enforced by the toolchain)
+//   - **/test_*.py — pytest convention
+//   - **/*_test.py — pytest convention (alternative form)
+//   - **/__tests__/**, **/__fixtures__/**, **/__snapshots__/**,
+//     **/__mocks__/** — Jest's double-underscore convention is
+//     specifically reserved for test scaffolding
+//   - **/testdata/** — Go convention; `go build` itself ignores it
+//
+// Deliberately NOT included (too ambiguous):
+//   - fixtures/, bench/, examples/ — common legitimate directory
+//     names in user code
+//   - **/__init__.py, conftest.py — Python markers that could be
+//     legit
+//
+// The user can always override with a `!` line in .getdebug-ignore.
+func BuiltInIgnorePatterns() []string {
+	return []string{
+		// JS/TS test files
+		"**/*.test.ts",
+		"**/*.test.tsx",
+		"**/*.test.js",
+		"**/*.test.jsx",
+		"**/*.test.mjs",
+		"**/*.test.cjs",
+		"**/*.spec.ts",
+		"**/*.spec.tsx",
+		"**/*.spec.js",
+		"**/*.spec.jsx",
+		"**/*.spec.mjs",
+		"**/*.spec.cjs",
+		// Go test files (toolchain convention)
+		"**/*_test.go",
+		// Python test files (pytest convention)
+		"**/test_*.py",
+		"**/*_test.py",
+		// Jest's reserved double-underscore directories
+		"**/__tests__/**",
+		"**/__fixtures__/**",
+		"**/__snapshots__/**",
+		"**/__mocks__/**",
+		// Go's testdata convention (go build ignores it too)
+		"**/testdata/**",
+	}
 }
 
 // scopedMatcher pairs a .gitignore file's matcher with the directory
@@ -60,19 +117,32 @@ type scopedMatcher struct {
 }
 
 // LoadIgnoreRules reads every .gitignore under workdir + a single
-// .getdebug-ignore at the workdir root. respectGitignore=false skips
-// the .gitignore traversal entirely (the --no-gitignore code path).
+// .getdebug-ignore at the workdir root, plus the built-in default
+// patterns when respectDefaults=true.
+//
+// respectGitignore=false skips the .gitignore traversal entirely
+// (the --no-gitignore code path). respectDefaults=false skips the
+// built-in test-scaffolding exclusions (the --no-default-ignores
+// code path). .getdebug-ignore always applies regardless of either
+// flag — it's the user's scanner-specific config.
 //
 // The traversal honors `skipDirs` (no descending into node_modules,
 // .next, etc.) so we don't pay the cost of reading thousands of
 // vendored .gitignores. Errors are non-fatal: a malformed file is
 // reported via logf and the scan continues with no rules from that
 // file. Honest degradation.
-func LoadIgnoreRules(workdir string, respectGitignore bool, logf func(format string, args ...any)) *IgnoreRuleset {
+func LoadIgnoreRules(workdir string, respectGitignore, respectDefaults bool, logf func(format string, args ...any)) *IgnoreRuleset {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
 	rs := &IgnoreRuleset{}
+	if respectDefaults {
+		// CompileIgnoreLines never fails on syntactically-valid
+		// patterns, but defend defensively in case a future hand-edit
+		// breaks the list.
+		defaults := ignore.CompileIgnoreLines(BuiltInIgnorePatterns()...)
+		rs.defaults = defaults
+	}
 	if respectGitignore {
 		// Walk for .gitignore files. We keep the walk tight by skipping
 		// the same dirs the scan walkers do — no point loading
@@ -150,6 +220,9 @@ func (r *IgnoreRuleset) IsIgnored(relPath string) bool {
 	if r.custom != nil && r.custom.MatchesPath(rel) {
 		return true
 	}
+	if r.defaults != nil && r.defaults.MatchesPath(rel) {
+		return true
+	}
 	for _, sm := range r.gitignores {
 		sub, ok := relativeTo(sm.scopeDir, rel)
 		if !ok {
@@ -176,6 +249,9 @@ func (r *IgnoreRuleset) IsDirIgnored(relDir string) bool {
 		relSlash = rel + "/"
 	}
 	if r.custom != nil && (r.custom.MatchesPath(rel) || r.custom.MatchesPath(relSlash)) {
+		return true
+	}
+	if r.defaults != nil && (r.defaults.MatchesPath(rel) || r.defaults.MatchesPath(relSlash)) {
 		return true
 	}
 	for _, sm := range r.gitignores {

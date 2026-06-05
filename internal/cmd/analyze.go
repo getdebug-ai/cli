@@ -16,6 +16,7 @@ import (
 
 var (
 	analyzeNoGitignore  bool
+	analyzeNoDefaultIgnores bool
 	analyzeWatch        bool
 	analyzeCI           bool
 	analyzeFailOn       string
@@ -90,6 +91,8 @@ Examples:
 func init() {
 	analyzeCmd.Flags().BoolVar(&analyzeNoGitignore, "no-gitignore", false,
 		"scan files even when they match .gitignore (default: respect .gitignore, matching the hosted scan)")
+	analyzeCmd.Flags().BoolVar(&analyzeNoDefaultIgnores, "no-default-ignores", false,
+		"scan test files / fixtures / snapshots the CLI excludes by default (**/*.test.*, **/*_test.go, **/__tests__/**, etc.)")
 	analyzeCmd.Flags().BoolVar(&analyzeWatch, "watch", false, "re-analyze on file changes (Phase 2 — not yet implemented)")
 	analyzeCmd.Flags().BoolVar(&analyzeCI, "ci", false, "exit non-zero on findings at or above --fail-on threshold")
 	analyzeCmd.Flags().StringVar(&analyzeFailOn, "fail-on", "high", "minimum severity that fails the build under --ci: critical|high|medium|low|any")
@@ -141,7 +144,7 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(cmd.ErrOrStderr(), "  "+format+"\n", args...)
 		}
 	}
-	rules := scan.LoadIgnoreRules(abs, !analyzeNoGitignore, ignoreLog)
+	rules := scan.LoadIgnoreRules(abs, !analyzeNoGitignore, !analyzeNoDefaultIgnores, ignoreLog)
 
 	start := time.Now()
 	res, err := scan.ScanSecrets(scan.ScanOptions{Workdir: abs, IgnoreRules: rules})

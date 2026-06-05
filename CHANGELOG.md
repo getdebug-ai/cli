@@ -1,5 +1,74 @@
 # Changelog
 
+## 0.4.0 — 2026-06-05
+
+Two substantial additions: **Python AI-app regex prefilters** (same
+five categories as the JS/TS set) and **default-ignore patterns**
+for common test scaffolding (so the first scan on a real codebase is
+signal-rich, not noise-rich). Plus a real product-bug fix in the
+unbounded-stream prefilter that comments could falsely satisfy.
+
+### Added
+- **Python AI-app regex prefilters** — five categories now fire on
+  `.py` files: `pii-in-prompt`, `unsafe-role-merge`,
+  `prompt-injection`, `unbounded-stream`, `unsafe-tool-output`.
+  Skipped `client-side-llm-key` for Python because the public-prefix
+  bundle-leak vector (NEXT_PUBLIC_ / VITE_) doesn't have a Python
+  equivalent. Patterns target the conventional shapes:
+  `{"role": "system", "content": f"...{var}..."}`, `stream=True`,
+  `subprocess.run(tool_call.input.cmd, shell=True)`, etc.
+- **Default ignore patterns** — every `getdebug analyze` now skips
+  test scaffolding by default: `**/*.test.*`, `**/*.spec.*`,
+  `**/*_test.go`, `**/test_*.py`, `**/*_test.py`, `**/__tests__/**`,
+  `**/__fixtures__/**`, `**/__snapshots__/**`, `**/__mocks__/**`,
+  `**/testdata/**`. Conservative — only patterns that are
+  unambiguously test-scaffolding (no `bench/`, no `fixtures/`,
+  nothing single-word ambiguous). Override with
+  `--no-default-ignores`.
+- **`go.sum` added to the generated-lockfile skip list** —
+  alongside `package-lock.json`, `pnpm-lock.yaml`, `Cargo.lock`,
+  etc. Go's lockfile is full of `h1:` dependency hashes that look
+  like high-entropy secrets to the regex pass; it never contains
+  real credentials.
+
+### Changed
+- **The unbounded-stream prefilter now strips Python comments from
+  the context window before checking for bound-stream markers.** A
+  comment like `# TODO: add timeout near streaming call` was wrongly
+  satisfying the "stream is bounded" check, silently suppressing
+  real findings. Caught during calibration; would have been a real
+  end-user FP.
+
+### Bench (https://www.getdebug.dev/bench)
+
+Python AI-app comparison (10 paired vulnerable/safe fixtures, three
+tools):
+
+```
+Tool        TP  FP  FN   Precision  Recall
+getdebug     5   0   0    100%       100%
+bandit       1   1   4    50%        20%
+semgrep      1   1   4    50%        20%
+```
+
+Bandit + Semgrep catch the generic `subprocess.run(shell=True)`
+shape but fire on the SAFE allowlist-then-run variant too, and miss
+the four behavioural AI-app categories entirely (pii-in-prompt,
+unsafe-role-merge, prompt-injection, unbounded-stream).
+
+Real-world signal/noise on `simonw/llm` (48 .py files):
+
+```
+Tool        Total findings    Signal
+bandit      1,189            1,158 are assert_used (pytest); 0 AI-app
+semgrep     3                3 generic-SAST hits; 0 AI-app
+getdebug    6                6 AI-app findings
+```
+
+vulnhuntr (Protect AI's LLM-driven AI-app specialist, the stated
+category leader) had multiple 2026-stack reliability issues that
+prevented a clean run — full notes in the release blog post.
+
 ## 0.3.0 — 2026-06-04
 
 Closes the local-vs-hosted parity gap that made dogfooding `analyze .`

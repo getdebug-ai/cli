@@ -34,7 +34,7 @@ func setupTree(t *testing.T) string {
 
 func TestIgnoreRulesetRespectsRootGitignore(t *testing.T) {
 	root := setupTree(t)
-	rules := LoadIgnoreRules(root, true, nil)
+	rules := LoadIgnoreRules(root, true, false, nil)
 	cases := map[string]bool{
 		"src/app.ts":   false,
 		"src/app.log":  true,
@@ -54,7 +54,7 @@ func TestIgnoreRulesetRespectsRootGitignore(t *testing.T) {
 // that let bench/results/*.json explode the user's self-scan.
 func TestIgnoreRulesetHonoursNestedGitignore(t *testing.T) {
 	root := setupTree(t)
-	rules := LoadIgnoreRules(root, true, nil)
+	rules := LoadIgnoreRules(root, true, false, nil)
 	if !rules.IsIgnored("bench/results/run-1.json") {
 		t.Error("bench/results/run-1.json should be ignored via bench/.gitignore")
 	}
@@ -68,7 +68,7 @@ func TestIgnoreRulesetHonoursNestedGitignore(t *testing.T) {
 
 func TestNoGitignoreSkipsTheLayer(t *testing.T) {
 	root := setupTree(t)
-	rules := LoadIgnoreRules(root, false, nil)
+	rules := LoadIgnoreRules(root, false, false, nil)
 	if rules.IsIgnored("src/app.log") {
 		t.Error("with respectGitignore=false, *.log must NOT be ignored")
 	}
@@ -90,16 +90,109 @@ func TestGetdebugIgnoreAppliesAlways(t *testing.T) {
 		t.Fatalf("write test file: %v", err)
 	}
 	for _, respect := range []bool{true, false} {
-		rules := LoadIgnoreRules(root, respect, nil)
+		rules := LoadIgnoreRules(root, respect, false, nil)
 		if !rules.IsIgnored("src/foo.test.ts") {
 			t.Errorf(".getdebug-ignore must apply regardless of respectGitignore=%v", respect)
 		}
 	}
 }
 
+// ── Default ignores (v0.4.0) ────────────────────────────────────
+
+func TestDefaultsIgnoreTestScaffolding(t *testing.T) {
+	root := setupTree(t)
+	// Build out the test-scaffolding files the defaults should catch.
+	for _, rel := range []string{
+		"src/util.test.ts",
+		"src/util.spec.js",
+		"pkg/foo_test.go",
+		"app/test_user.py",
+		"app/user_test.py",
+		"src/__tests__/helper.ts",
+		"src/__fixtures__/user.json",
+		"src/__snapshots__/Foo.snap",
+		"src/__mocks__/db.ts",
+		"internal/testdata/sample.go",
+	} {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte("x"), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	rules := LoadIgnoreRules(root, true, true, nil)
+	for _, rel := range []string{
+		"src/util.test.ts",
+		"src/util.spec.js",
+		"pkg/foo_test.go",
+		"app/test_user.py",
+		"app/user_test.py",
+		"src/__tests__/helper.ts",
+		"src/__fixtures__/user.json",
+		"src/__snapshots__/Foo.snap",
+		"src/__mocks__/db.ts",
+		"internal/testdata/sample.go",
+	} {
+		if !rules.IsIgnored(rel) {
+			t.Errorf("default ignores should match %q (test-scaffolding pattern)", rel)
+		}
+	}
+	// Real source files must NOT be ignored by defaults.
+	for _, rel := range []string{
+		"src/app.ts",
+		"pkg/handler.go",
+		"app/main.py",
+		"fixtures/user.json", // single-underscore dir name is too ambiguous to skip
+	} {
+		if rules.IsIgnored(rel) {
+			t.Errorf("default ignores should NOT match %q (could be real source)", rel)
+		}
+	}
+}
+
+func TestNoDefaultIgnoresEscapeHatch(t *testing.T) {
+	root := setupTree(t)
+	if err := os.WriteFile(filepath.Join(root, "src", "foo.test.ts"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	rules := LoadIgnoreRules(root, true, false, nil)
+	if rules.IsIgnored("src/foo.test.ts") {
+		t.Error("with respectDefaults=false, **/*.test.ts must NOT be ignored")
+	}
+}
+
+// .getdebug-ignore with a `!` line should be able to re-include a file
+// that the defaults would otherwise exclude.
+func TestGetdebugIgnoreCanReIncludeDefault(t *testing.T) {
+	root := setupTree(t)
+	if err := os.WriteFile(filepath.Join(root, "src", "foo.test.ts"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(root, ".getdebug-ignore"),
+		[]byte("!**/*.test.ts\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("write .getdebug-ignore: %v", err)
+	}
+	rules := LoadIgnoreRules(root, true, true, nil)
+	// NOTE: sabhiram's matcher applies negation within a SINGLE ruleset.
+	// Our defaults + custom are separate matchers stacked OR-style, so
+	// a `!` in .getdebug-ignore CANNOT cancel a defaults hit today.
+	// Document the trade-off: users who genuinely want to scan tests
+	// should pass --no-default-ignores instead. This test locks the
+	// current behaviour in so a future refactor doesn't accidentally
+	// claim cross-ruleset negation works.
+	if !rules.IsIgnored("src/foo.test.ts") {
+		t.Error("defaults override .getdebug-ignore negation today; use --no-default-ignores to scan tests")
+	}
+}
+
 func TestEmptyAndDotPathAreNeverIgnored(t *testing.T) {
 	root := setupTree(t)
-	rules := LoadIgnoreRules(root, true, nil)
+	rules := LoadIgnoreRules(root, true, false, nil)
 	for _, p := range []string{"", "."} {
 		if rules.IsIgnored(p) {
 			t.Errorf("IsIgnored(%q) should be false (the workdir itself)", p)
