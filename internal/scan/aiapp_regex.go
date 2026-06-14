@@ -131,6 +131,162 @@ var unsafeToolOutputRe = regexp.MustCompile(
 	`\b(?:exec|execSync|spawn|spawnSync|eval|run|runCommand|runSync)\s*\(\s*[^)]*?\b(?:tool|toolUse|toolCall|block|toolResult|toolOutput|message|response)\.(?:input|arguments|args|parameters|result|content)\.`,
 )
 
+// unsafeToolOutputArgsRe catches the canonical SDK tool-function shape
+// where args.X (the typed function parameter) flows into a dangerous
+// sink. Anthropic + OpenAI tool-callable functions take the SDK's
+// validated input as `args` by convention:
+//
+//   async execute(args: { command: string }) {
+//     await execAsync(args.command);   // ← canonical sink
+//   }
+//
+// SQL sinks are included alongside shell sinks: postgres-js's
+// `sql.unsafe(args.X)` bypasses parameterization the same way `exec`
+// bypasses the shell. better-sqlite3's `db.prepare(args.X).all()` is
+// the same shape under a different name.
+// 0.5.4 — added file-write sinks (writeFileSync, writeFile,
+// appendFileSync, appendFile, createWriteStream) and Function-form
+// code-injection sinks. writeFileSync(args.path, ...) is the canonical
+// path-traversal sink in the agent-framework idiom; `new Function(...)`
+// (the Function constructor) is eval's less-obvious sibling.
+var unsafeToolOutputArgsRe = regexp.MustCompile(
+	`\b(?:exec|execSync|execAsync|spawn|spawnSync|eval|run|runCommand|runSync|sql\.unsafe|db\.unsafe|db\.query|pool\.unsafe|pool\.query|client\.unsafe|client\.query|db\.prepare|writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream|Function)\s*\(\s*[^)]{0,200}?\bargs\.\w+`,
+)
+
+// unboundedFetchRe — 0.5.4 addition.
+// `fetch(<arg containing args.X>, ...)` without a `signal:` option in
+// the opts object. Catches the tool-side streaming-fetch pattern the
+// stream:true and messages.stream detectors miss.
+var unboundedFetchRe = regexp.MustCompile(
+	`\bfetch\s*\(\s*[^,)]{0,160}?\bargs\.\w+`,
+)
+
+// signalInFetchOptsRe — used to gate unboundedFetchRe hits. If the
+// surrounding call has a `signal:` key in the opts object, suppress.
+var signalInFetchOptsRe = regexp.MustCompile(
+	`\bsignal\s*:`,
+)
+
+// htmlKeyEmbedRe — 0.5.4 addition.
+// `res.send` / `response.send` / `reply.send` of a backtick-quoted
+// template literal that contains `process.env.X_API_KEY` (or similar)
+// embedded as an HTML attribute or text node. Semantically equivalent
+// to NEXT_PUBLIC_ exposure but via server-rendered HTML.
+var htmlKeyEmbedRe = regexp.MustCompile(
+	"(?s)\\b(?:res\\.send|response\\.send|reply\\.send)\\s*\\(\\s*`[^`]{0,800}?\\$\\{\\s*process\\.env\\.[A-Z][A-Z0-9_]*(?:_API_KEY|_KEY|_TOKEN|_SECRET)\\s*\\}",
+)
+
+// aiAppFileNameSignalRe — 0.5.4 addition.
+// When the FILE name signals AI-app context (user-snapshot.ts,
+// profile-context.ts, prompt-builder.ts, etc.) the piiInPromptRe
+// finding fires without requiring an LLM-call marker in the same
+// file's ±20-line window. Catches the cross-file case where the
+// helper that JSON.stringify's the user is imported by the LLM-
+// calling route.
+var aiAppFileNameSignalRe = regexp.MustCompile(
+	`(?i)(?:[/-]|^)(?:user-snapshot|profile-context|prompt-builder|prompt-context|message-builder|conversation-context|chat-context|system-prompt|user-context|llm-context)\.(?:ts|tsx|js|jsx|mjs|cjs|py|svelte\.ts|svelte\.js)$`,
+)
+
+// keyInResponseRe catches a server route returning an LLM provider API
+// key in the JSON response body. Pattern: a Response.json / res.json /
+// `return json` call whose body has an apiKey/secret/token property
+// whose value is `process.env.X_API_KEY` (or similar). The (?s) flag
+// allows the body to span lines.
+//
+// Semantically equivalent to shipping the key in the client bundle —
+// hidden behind an unauthed GET instead of inlined into the bundle.
+// Categorised as client-side-llm-key because the effect is identical
+// (key reaches the browser).
+var keyInResponseRe = regexp.MustCompile(
+	`(?s)(?:Response\.json|res\.json|res\.send|return\s+json|return\s+Response\.json)\s*\(\s*\{[^}]{0,400}?(?:apiKey|api_key|secret|token|key)\s*:\s*process\.env\.[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET)`,
+)
+
+// keyInResponseSvelteRe — 0.5.3 addition.
+// SvelteKit's `$env/static/private` injects env vars as bare imported
+// identifiers (not via process.env). The leak shape is:
+//
+//   import { ANTHROPIC_API_KEY } from '$env/static/private';
+//   return json({ apiKey: ANTHROPIC_API_KEY, ... });
+//
+// We detect the response side (json(...) call with an apiKey/secret/
+// token property whose value is a bare UPPERCASE_*_KEY identifier).
+// The same shape works for any framework that lets the user destructure
+// env vars from a module — SvelteKit is the canonical case but Next.js
+// also supports it via `@/lib/env`-style indirection.
+var keyInResponseSvelteRe = regexp.MustCompile(
+	`(?s)(?:Response\.json|return\s+json|return\s+Response\.json|res\.json)\s*\(\s*\{[^}]{0,400}?(?:apiKey|api_key|secret|token|key)\s*:\s*[A-Z][A-Z0-9_]*(?:_API_KEY|_KEY|_TOKEN|_SECRET)\b`,
+)
+
+// publicEnvKeyRe — 0.5.3 addition.
+// Catches the SvelteKit / Astro / Nuxt shape of the same NEXT_PUBLIC_
+// mistake: `import { PUBLIC_FOO_API_KEY } from '$env/static/public'`.
+// SvelteKit physically inlines anything from $env/static/public into
+// the client bundle (same contract as NEXT_PUBLIC_); the existing
+// clientLlmKeyRe only matches process.env / import.meta.env / Bun.env
+// access patterns, not the destructured import shape.
+var publicEnvKeyRe = regexp.MustCompile(
+	`import\s*\{[^}]*\b(PUBLIC_[A-Z0-9_]*(?:OPENAI|ANTHROPIC|CLAUDE|GEMINI|GOOGLE_AI|XAI|GROK|COHERE|MISTRAL|PERPLEXITY|DEEPSEEK|GROQ|REPLICATE|HUGGINGFACE|TOGETHER|FIREWORKS|OLLAMA)[A-Z0-9_]*(?:KEY|API_KEY|SECRET|TOKEN))\b[^}]*\}\s*from\s*['"]\$env/static/public['"]`,
+)
+
+// svelteHtmlSinkRe — 0.5.3 addition.
+// Svelte's `{@html X}` directive is the equivalent of React's
+// `dangerouslySetInnerHTML` — it renders untrusted HTML into the DOM
+// with no sanitization. When X comes from tool/assistant content
+// (anywhere in the same file), it's an XSS sink for attacker-
+// controllable LLM output. We require a marked.parse / tool / assistant
+// reference within ±40 lines so plain `{@html staticString}` doesn't
+// over-fire.
+var svelteHtmlSinkRe = regexp.MustCompile(`\{\s*@html\s+\w+`)
+var svelteHtmlContextRe = regexp.MustCompile(
+	`(?:marked\.parse|role\s*===?\s*['"](?:assistant|tool)['"]|toolUse|tool_use|messages\b|content\s*:)`,
+)
+
+// anthropicSystemParamRe — 0.5.3 addition.
+// Anthropic's SDK takes the system prompt as a top-level `system:`
+// parameter, NOT as a `role: 'system'` message inside `messages[]`.
+// The existing scanUnsafeRoleMerge detector matches the messages-array
+// shape and structurally cannot see Anthropic's separate `system:`
+// parameter. This detector mirrors it: `system: <template literal with
+// interpolation>` inside an .messages.create / .messages.stream call.
+var anthropicSystemParamRe = regexp.MustCompile(
+	"(?s)\\.messages\\.(?:create|stream)\\s*\\([^)]{0,400}?system\\s*:\\s*`[^`]*\\$\\{[^}]+\\}",
+)
+var anthropicSystemParamIdentRe = regexp.MustCompile(
+	`(?s)\.messages\.(?:create|stream)\s*\([^)]{0,400}?system\s*:\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\s*[,)]`,
+)
+// templateConcatAssignedRe matches `const NAME = \`...${X}...\`` for the
+// purpose of confirming an identifier referenced by anthropicSystemParamIdentRe
+// was built from a template-literal concat. (?s) so backticks can span lines.
+var templateConcatAssignedRe = regexp.MustCompile(
+	"(?s)(?:const|let|var)\\s+(\\w+)\\s*=\\s*`[^`]*\\$\\{[^}]+\\}[^`]*`",
+)
+// systemTernaryAssignedRe matches `const NAME = cond ? \`...${X}...\` : ...`
+// for the ternary-with-template-literal shape (used in cst-sveltekit-stream's
+// chat/+server.ts). (?s) so the ternary body can span lines.
+var systemTernaryAssignedRe = regexp.MustCompile(
+	"(?s)(?:const|let|var)\\s+(\\w+)\\s*=\\s*[^;]+\\?\\s*`[^`]*\\$\\{[^}]+\\}",
+)
+
+// anthropicStreamCallRe — 0.5.3 addition.
+// Anthropic's streaming form is a method call (`anthropic.messages.stream(`)
+// rather than OpenAI's `stream: true` property. The existing
+// streamTrueDetectorRe only matches the property form. This regex
+// catches the Anthropic shape; abort-in-scope check still gates whether
+// it counts as unbounded.
+var anthropicStreamCallRe = regexp.MustCompile(
+	`\.messages\.stream\s*\(`,
+)
+
+// allowlistGuardRe — 0.5.3 addition.
+// Precision improvement: when a `db.prepare(args.X)` (or sql.unsafe etc.)
+// is preceded within ~10 lines by an allowlist check on the SAME args
+// field (`if (!ALLOWLIST.has(args.X))` or `if (!ALLOWED.has(args.X))`),
+// suppress the unsafeToolOutputArgs hit. Reduces FP on table-allowlist
+// guarded query patterns.
+var allowlistGuardRe = regexp.MustCompile(
+	`(?:if\s*\(\s*!?\s*[A-Z_][A-Z0-9_]*(?:_ALLOWLIST|_ALLOWED|_ALLOW|ALLOWLIST|ALLOWED|ALLOW)\.has\s*\(\s*args\.(\w+)\s*\))`,
+)
+
 // AiAppRegexResult mirrors the existing scan-pass return shapes so the
 // CLI's analyze command can emit honest coverage numbers (files
 // considered, scanned, errors, etc.) the same way as secrets +
@@ -173,12 +329,21 @@ func ScanAiAppRegex(workdir string, rules *IgnoreRuleset, logf func(format strin
 			}
 			return nil
 		}
-		ext := strings.ToLower(filepath.Ext(d.Name()))
-		switch ext {
-		case ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py":
-			// supported — JS/TS goes through the original scanners,
-			// .py through the Python-idiom scanners (dispatched in
-			// scanAiAppRegex based on the path extension).
+		name := d.Name()
+		ext := strings.ToLower(filepath.Ext(name))
+		// `.svelte` and `.svelte.ts` / `.svelte.js` files contain JS/TS
+		// that should be scanned alongside the regular JS/TS extensions.
+		// 0.5.3 — added .svelte support to catch Svelte-specific
+		// patterns (`{@html ...}`, `$env/static/public` imports) plus
+		// the existing JS regexes that work inside `<script lang="ts">`
+		// blocks.
+		isSvelte := strings.HasSuffix(name, ".svelte") || strings.HasSuffix(name, ".svelte.ts") || strings.HasSuffix(name, ".svelte.js")
+		switch {
+		case ext == ".ts", ext == ".tsx", ext == ".js", ext == ".jsx", ext == ".mjs", ext == ".cjs", ext == ".py", ext == ".go", ext == ".rb":
+			// supported. .go (0.5.7) and .rb (0.5.8) added — both gated to
+			// LLM-SDK files inside their scanners so non-AI code stays silent.
+		case isSvelte:
+			// supported via the JS dispatcher.
 		default:
 			return nil
 		}
@@ -226,6 +391,10 @@ func scanAiAppRegex(relPath, source string) []Finding {
 	switch ext := lowerExt(relPath); ext {
 	case ".py":
 		return scanAiAppRegexPython(relPath, source)
+	case ".go":
+		return scanAiAppRegexGo(relPath, source)
+	case ".rb":
+		return scanAiAppRegexRuby(relPath, source)
 	default:
 		return scanAiAppRegexJS(relPath, source)
 	}
@@ -238,7 +407,15 @@ func scanAiAppRegex(relPath, source string) []Finding {
 func scanAiAppRegexJS(relPath, source string) []Finding {
 	var out []Finding
 	out = append(out, scanClientSideLlmKey(relPath, source)...)
+	out = append(out, scanPublicEnvKey(relPath, source)...)
+	out = append(out, scanKeyInResponse(relPath, source)...)
+	out = append(out, scanKeyInResponseSvelte(relPath, source)...)
+	out = append(out, scanHtmlKeyEmbed(relPath, source)...)
 	out = append(out, scanUnboundedStream(relPath, source)...)
+	out = append(out, scanAnthropicUnboundedStream(relPath, source)...)
+	out = append(out, scanUnboundedFetch(relPath, source)...)
+	out = append(out, scanAnthropicSystemMerge(relPath, source)...)
+	out = append(out, scanSvelteHtmlSink(relPath, source)...)
 	out = append(out, scanPiiInPrompt(relPath, source)...)
 	out = append(out, scanUnsafeRoleMerge(relPath, source)...)
 	out = append(out, scanPromptInjection(relPath, source)...)
@@ -381,7 +558,13 @@ func scanPiiInPrompt(relPath, source string) []Finding {
 			to = len(lines)
 		}
 		window := strings.Join(lines[from:to], "\n")
-		if !llmCallContextRe.MatchString(window) {
+		// 0.5.4 — if the file name signals AI-app context
+		// (user-snapshot.ts, profile-context.ts, prompt-builder.ts, etc.)
+		// the LLM-call-marker gate is relaxed. The helper that
+		// JSON.stringify's the user is imported by the LLM-calling
+		// route; the LLM call lives in a different file by design.
+		fileNameSignals := aiAppFileNameSignalRe.MatchString(relPath)
+		if !fileNameSignals && !llmCallContextRe.MatchString(window) {
 			continue
 		}
 		matchedSpan := source[loc[2]:loc[3]] // capture group 1: the var name
@@ -579,14 +762,220 @@ func scanPromptInjection(relPath, source string) []Finding {
 	return out
 }
 
-// scanUnsafeToolOutput fires on a shell/exec sink whose first arg
-// references an LLM tool-output field. The safe variant routes the
-// tool field through an allowlist before reaching the sink.
+// scanUnsafeToolOutput fires on a shell/exec/SQL sink whose first arg
+// references an LLM tool-output field. Runs two complementary regexes:
+//
+//   unsafeToolOutputRe     — sink(tool.input.X)  (SDK-typed tool refs)
+//   unsafeToolOutputArgsRe — sink(args.X)        (canonical exec(args)
+//                                                  shape + SQL sinks)
+//
+// Dedupes by line — a single sink at line N fires once even if both
+// regexes happen to match the same span.
 func scanUnsafeToolOutput(relPath, source string) []Finding {
 	var out []Finding
-	for _, loc := range unsafeToolOutputRe.FindAllStringIndex(source, -1) {
+	seenLines := make(map[int]bool)
+	emit := func(loc []int, title, explanation, cwe string) {
 		matchStart := loc[0]
 		if inNonCodeContext(source, matchStart) {
+			return
+		}
+		line := lineNumberAt(source, matchStart)
+		if seenLines[line] {
+			return
+		}
+		seenLines[line] = true
+		matchedSpan := source[loc[0]:loc[1]]
+		out = append(out, Finding{
+			FilePath:    relPath,
+			LineStart:   line,
+			LineEnd:     line,
+			Category:    "unsafe-tool-output",
+			Severity:    unsafeToolOutputSeverity,
+			Title:       title,
+			Explanation: explanation,
+			ContentHash: hashAiAppFinding(relPath, line, "unsafe-tool-output", matchedSpan),
+			Snippet:     extractLine(source, line),
+			CWE:         cwe,
+			OWASP:       "A03",
+			Detection:   "regex",
+		})
+	}
+	for _, loc := range unsafeToolOutputRe.FindAllStringIndex(source, -1) {
+		emit(loc,
+			"LLM tool output flows directly into shell sink",
+			"A shell or eval sink is being called with a value that came from an LLM tool call (tool.input.*, block.input.*, etc.). An attacker who controls the model output via prompt injection upstream gets arbitrary command execution on the host. Route the tool field through a fixed allowlist (tag → vetted command) before any shell/eval call.",
+			"CWE-78",
+		)
+	}
+	for _, loc := range unsafeToolOutputArgsRe.FindAllStringIndex(source, -1) {
+		matched := source[loc[0]:loc[1]]
+		// 0.5.3 precision improvement: skip when an allowlist guard
+		// (`if (!ALLOWLIST.has(args.X))`) precedes the sink within the
+		// same function. We scan backward ~30 lines for the guard
+		// pattern on the SAME args.X field referenced by the sink.
+		if precededByAllowlistGuard(source, loc[0], matched) {
+			continue
+		}
+		cwe := "CWE-78"
+		title := "LLM tool input flows directly into shell/SQL sink"
+		explanation := "A tool-callable function takes user-supplied input as `args.X` and passes it unsanitized into a shell, eval, or raw-SQL sink. Because the SDK lets the model decide what to pass as args, any prompt injection upstream becomes arbitrary command/SQL execution. Route args through a fixed allowlist or use parameterized queries before reaching the sink."
+		if strings.Contains(matched, "sql.") || strings.Contains(matched, "db.") || strings.Contains(matched, "pool.") || strings.Contains(matched, "client.") {
+			cwe = "CWE-89"
+			title = "LLM tool input flows directly into raw-SQL sink"
+			explanation = "A tool-callable function takes user-supplied input as `args.X` and passes it into a raw SQL execution path (sql.unsafe, db.prepare, pool.unsafe, etc.). These bypass parameterization. Because the model decides args.X, prompt injection upstream becomes SQL injection. Use parameterized queries (sql`select ... ${value}`) or a table-allowlist read path."
+		}
+		emit(loc, title, explanation, cwe)
+	}
+	return out
+}
+
+// precededByAllowlistGuard returns true when a `Set.has(args.X)`-style
+// allowlist check on the SAME args field appears within ~30 lines
+// above pos. Used to suppress the args.X-into-sink finding when the
+// pattern is allowlist-gated. Conservative: only suppresses if the
+// args field name matches exactly.
+func precededByAllowlistGuard(source string, pos int, sinkMatch string) bool {
+	// Find the args.<field> reference in the sink match.
+	argFieldRe := regexp.MustCompile(`\bargs\.(\w+)`)
+	m := argFieldRe.FindStringSubmatch(sinkMatch)
+	if len(m) < 2 {
+		return false
+	}
+	argField := m[1]
+	// Scan ~30 lines backward.
+	start := pos
+	lineCount := 0
+	for start > 0 && lineCount < 30 {
+		start--
+		if source[start] == '\n' {
+			lineCount++
+		}
+	}
+	if start < 0 {
+		start = 0
+	}
+	window := source[start:pos]
+	// Look for an allowlist .has(args.<field>) check on the same field.
+	for _, g := range allowlistGuardRe.FindAllStringSubmatch(window, -1) {
+		if len(g) >= 2 && g[1] == argField {
+			return true
+		}
+	}
+	return false
+}
+
+// scanPublicEnvKey — 0.5.3 addition.
+// SvelteKit / Astro / Nuxt shape of NEXT_PUBLIC_-style key exposure:
+// `import { PUBLIC_X_API_KEY } from '$env/static/public'`. The existing
+// clientLlmKeyRe matches process.env.* shapes only; this one catches
+// the destructured-import shape.
+func scanPublicEnvKey(relPath, source string) []Finding {
+	var out []Finding
+	seen := make(map[int]bool)
+	for _, loc := range publicEnvKeyRe.FindAllStringSubmatchIndex(source, -1) {
+		matchStart := loc[0]
+		if inNonCodeContext(source, matchStart) {
+			continue
+		}
+		line := lineNumberAt(source, matchStart)
+		if seen[line] {
+			continue
+		}
+		seen[line] = true
+		matchedSpan := source[loc[2]:loc[3]] // capture group 1: the var name
+		out = append(out, Finding{
+			FilePath:    relPath,
+			LineStart:   line,
+			LineEnd:     line,
+			Category:    "client-side-llm-key",
+			Severity:    clientLlmKeySeverity,
+			Title:       "LLM provider key exposed via $env/static/public",
+			Explanation: "A PUBLIC_-prefixed LLM provider env var is imported from SvelteKit's `$env/static/public` (also applies to Astro/Nuxt with the same prefix contract). PUBLIC_ vars are physically inlined into the client bundle at build time — once shipped, the key is published. Move the key to the private channel (`$env/static/private`) and proxy the upstream API call through a server endpoint.",
+			ContentHash: hashAiAppFinding(relPath, line, "client-side-llm-key", matchedSpan),
+			Snippet:     extractLine(source, line),
+			CWE:         "CWE-798",
+			OWASP:       "A02",
+			Detection:   "regex",
+		})
+	}
+	return out
+}
+
+// scanKeyInResponseSvelte — 0.5.3 addition.
+// SvelteKit / generic shape: a `json({apiKey: <bare ident>_API_KEY})`
+// response. process.env access doesn't appear; the env var was
+// destructured from `$env/static/private` at import time, then handed
+// straight back through the response. Same effect as the existing
+// keyInResponseRe — categorised under client-side-llm-key.
+func scanKeyInResponseSvelte(relPath, source string) []Finding {
+	var out []Finding
+	for _, loc := range keyInResponseSvelteRe.FindAllStringIndex(source, -1) {
+		matchStart := loc[0]
+		if inNonCodeContext(source, matchStart) {
+			continue
+		}
+		span := source[loc[0]:loc[1]]
+		// Skip if the response body explicitly references process.env —
+		// that's keyInResponseRe's domain, avoid double-firing.
+		if strings.Contains(span, "process.env.") {
+			continue
+		}
+		line := lineNumberAt(source, matchStart)
+		// Point at the line of the bare identifier (the actual leak).
+		identMatchRe := regexp.MustCompile(`(?:apiKey|api_key|secret|token|key)\s*:\s*[A-Z][A-Z0-9_]*(?:_API_KEY|_KEY|_TOKEN|_SECRET)\b`)
+		if idx := identMatchRe.FindStringIndex(span); len(idx) == 2 {
+			line = lineNumberAt(source, matchStart+idx[0])
+		}
+		out = append(out, Finding{
+			FilePath:    relPath,
+			LineStart:   line,
+			LineEnd:     line,
+			Category:    "client-side-llm-key",
+			Severity:    clientLlmKeySeverity,
+			Title:       "Server route returns LLM provider key in response body",
+			Explanation: "A route handler returns an LLM provider API key (imported via destructuring from $env/static/private or a similar pattern) in its JSON response body. Anyone who can reach the endpoint can read the key. Refactor so the route proxies the upstream API call instead of returning the credential.",
+			ContentHash: hashAiAppFinding(relPath, line, "client-side-llm-key", span),
+			Snippet:     extractLine(source, line),
+			CWE:         "CWE-522",
+			OWASP:       "A02",
+			Detection:   "regex",
+		})
+	}
+	return out
+}
+
+// scanSvelteHtmlSink — 0.5.3 addition.
+// `{@html X}` is Svelte's directive for rendering raw HTML, equivalent
+// to React's dangerouslySetInnerHTML. When X is built from tool/
+// assistant content (e.g. marked.parse() of LLM output), it's an XSS
+// sink for attacker-influenced text. Categorised under unsafe-tool-
+// output. Gated by a context check — must find a marked.parse / role
+// / messages reference within ±40 lines so static-content @html calls
+// don't fire.
+func scanSvelteHtmlSink(relPath, source string) []Finding {
+	var out []Finding
+	for _, loc := range svelteHtmlSinkRe.FindAllStringIndex(source, -1) {
+		matchStart := loc[0]
+		// Context check: marked.parse / role / messages / tool ref in
+		// a ±40 line window.
+		windowStart := matchStart
+		windowEnd := loc[1]
+		linesBack := 0
+		for windowStart > 0 && linesBack < 40 {
+			windowStart--
+			if source[windowStart] == '\n' {
+				linesBack++
+			}
+		}
+		linesFwd := 0
+		for windowEnd < len(source) && linesFwd < 40 {
+			if source[windowEnd] == '\n' {
+				linesFwd++
+			}
+			windowEnd++
+		}
+		window := source[windowStart:windowEnd]
+		if !svelteHtmlContextRe.MatchString(window) {
 			continue
 		}
 		line := lineNumberAt(source, matchStart)
@@ -597,12 +986,311 @@ func scanUnsafeToolOutput(relPath, source string) []Finding {
 			LineEnd:     line,
 			Category:    "unsafe-tool-output",
 			Severity:    unsafeToolOutputSeverity,
-			Title:       "LLM tool output flows directly into shell sink",
-			Explanation: "A shell or eval sink is being called with a value that came from an LLM tool call (tool.input.*, block.input.*, etc.). An attacker who controls the model output via prompt injection upstream gets arbitrary command execution on the host. Route the tool field through a fixed allowlist (tag → vetted command) before any shell/eval call.",
+			Title:       "Svelte {@html ...} renders LLM-influenced content without sanitization",
+			Explanation: "Svelte's {@html ...} directive renders raw HTML — the equivalent of React's dangerouslySetInnerHTML. When the value comes from marked.parse() of tool/assistant content (or any LLM-influenced source), attacker-controllable HTML reaches the DOM. CWE-79. Pass the content through a sanitizer (e.g. DOMPurify) before rendering, or render as plain text.",
 			ContentHash: hashAiAppFinding(relPath, line, "unsafe-tool-output", matchedSpan),
 			Snippet:     extractLine(source, line),
-			CWE:         "CWE-78",
+			CWE:         "CWE-79",
 			OWASP:       "A03",
+			Detection:   "regex",
+		})
+	}
+	return out
+}
+
+// scanAnthropicSystemMerge — 0.5.3 addition.
+// Anthropic's SDK takes the system prompt as a top-level `system:`
+// parameter (not as a `role: 'system'` message inside messages[]).
+// The existing scanUnsafeRoleMerge cannot see this shape. Two cases:
+//
+//   1. Inline template: `messages.create({system: \`${x}\`, ...})`
+//      — fires immediately on anthropicSystemParamRe.
+//
+//   2. Indirect identifier: `messages.create({system: systemPrompt})`
+//      where `systemPrompt` was assigned a template-literal-with-
+//      interpolation earlier in the same file. Catches the canonical
+//      `const systemPrompt = \`${baseSystem}\n${userInput}\`` shape.
+func scanAnthropicSystemMerge(relPath, source string) []Finding {
+	var out []Finding
+	seen := make(map[int]bool)
+	// Case 1: inline template literal in the system: parameter.
+	for _, loc := range anthropicSystemParamRe.FindAllStringIndex(source, -1) {
+		if inNonCodeContext(source, loc[0]) {
+			continue
+		}
+		// Position the finding at the line where `system:` appears.
+		matchSpan := source[loc[0]:loc[1]]
+		sysIdx := strings.Index(matchSpan, "system")
+		line := lineNumberAt(source, loc[0])
+		if sysIdx >= 0 {
+			line = lineNumberAt(source, loc[0]+sysIdx)
+		}
+		if seen[line] {
+			continue
+		}
+		seen[line] = true
+		matchedSpan := matchSpan
+		out = append(out, Finding{
+			FilePath:    relPath,
+			LineStart:   line,
+			LineEnd:     line,
+			Category:    "unsafe-role-merge",
+			Severity:    unsafeRoleMergeSeverity,
+			Title:       "Anthropic system: parameter contains template-literal interpolation",
+			Explanation: "Anthropic's messages.create / messages.stream takes a top-level `system:` parameter that the model treats with operator authority — the structural equivalent of OpenAI's `role: 'system'` message. Interpolating user-controllable values into the system parameter is the same vulnerability under a different SDK shape. Keep system content static; route variable inputs through the user role.",
+			ContentHash: hashAiAppFinding(relPath, line, "unsafe-role-merge", matchedSpan),
+			Snippet:     extractLine(source, line),
+			CWE:         "CWE-1039",
+			OWASP:       "A04",
+			Detection:   "regex",
+		})
+	}
+	// Case 2: indirect identifier — `system: systemPrompt` where
+	// systemPrompt was built from a template literal earlier.
+	// Build a set of variable names assigned to template-literal
+	// interpolation patterns.
+	tmplVars := make(map[string]bool)
+	for _, m := range templateConcatAssignedRe.FindAllStringSubmatch(source, -1) {
+		if len(m) >= 2 {
+			tmplVars[m[1]] = true
+		}
+	}
+	for _, m := range systemTernaryAssignedRe.FindAllStringSubmatch(source, -1) {
+		if len(m) >= 2 {
+			tmplVars[m[1]] = true
+		}
+	}
+	for _, loc := range anthropicSystemParamIdentRe.FindAllStringSubmatchIndex(source, -1) {
+		if inNonCodeContext(source, loc[0]) {
+			continue
+		}
+		// Capture group 1 spans loc[2]:loc[3].
+		if loc[2] < 0 || loc[3] < 0 {
+			continue
+		}
+		ident := source[loc[2]:loc[3]]
+		if !tmplVars[ident] {
+			continue
+		}
+		// Position at the `system:` line within the matched span.
+		matchSpan := source[loc[0]:loc[1]]
+		sysIdx := strings.Index(matchSpan, "system")
+		line := lineNumberAt(source, loc[0])
+		if sysIdx >= 0 {
+			line = lineNumberAt(source, loc[0]+sysIdx)
+		}
+		if seen[line] {
+			continue
+		}
+		seen[line] = true
+		out = append(out, Finding{
+			FilePath:    relPath,
+			LineStart:   line,
+			LineEnd:     line,
+			Category:    "unsafe-role-merge",
+			Severity:    unsafeRoleMergeSeverity,
+			Title:       "Anthropic system: parameter built from template-literal concat",
+			Explanation: "Anthropic's `system:` parameter is assigned a variable that was built from a template literal with `${...}` interpolation. The interpolated value reaches the operator channel where the model treats it with elevated authority. Keep system content static; route variable inputs through the user role.",
+			ContentHash: hashAiAppFinding(relPath, line, "unsafe-role-merge", source[loc[0]:loc[1]]),
+			Snippet:     extractLine(source, line),
+			CWE:         "CWE-1039",
+			OWASP:       "A04",
+			Detection:   "regex",
+		})
+	}
+	return out
+}
+
+// scanAnthropicUnboundedStream — 0.5.3 addition.
+// Anthropic's streaming uses a method call (`anthropic.messages.stream(`)
+// rather than OpenAI's `stream: true` property. The existing
+// scanUnboundedStream only matches `stream: true`. This detector
+// catches the Anthropic shape with the same abort-in-scope gate.
+func scanAnthropicUnboundedStream(relPath, source string) []Finding {
+	var out []Finding
+	seen := make(map[int]bool)
+	for _, loc := range anthropicStreamCallRe.FindAllStringIndex(source, -1) {
+		matchStart := loc[0]
+		if inNonCodeContext(source, matchStart) {
+			continue
+		}
+		// Same abort-in-scope gate as scanUnboundedStream — if there's
+		// an AbortController / signal: / .abort( in the surrounding
+		// window, treat as bounded.
+		windowStart := matchStart
+		windowEnd := loc[1]
+		linesBack := 0
+		for windowStart > 0 && linesBack < 20 {
+			windowStart--
+			if source[windowStart] == '\n' {
+				linesBack++
+			}
+		}
+		linesFwd := 0
+		for windowEnd < len(source) && linesFwd < 20 {
+			if source[windowEnd] == '\n' {
+				linesFwd++
+			}
+			windowEnd++
+		}
+		window := source[windowStart:windowEnd]
+		if abortInScopeRe.MatchString(window) {
+			continue
+		}
+		line := lineNumberAt(source, matchStart)
+		if seen[line] {
+			continue
+		}
+		seen[line] = true
+		matchedSpan := source[loc[0]:loc[1]]
+		out = append(out, Finding{
+			FilePath:    relPath,
+			LineStart:   line,
+			LineEnd:     line,
+			Category:    "unbounded-stream",
+			Severity:    unboundedStreamSeverity,
+			Title:       "Anthropic messages.stream() call without abort handling",
+			Explanation: "An Anthropic streaming call (anthropic.messages.stream) has no AbortController or `signal:` parameter in its surrounding scope. If the client disconnects or the model hangs, the request keeps a worker slot occupied and continues billing tokens. Pass `signal: controller.signal` and abort the controller on the request's abort event (request.signal.addEventListener('abort', ...)).",
+			ContentHash: hashAiAppFinding(relPath, line, "unbounded-stream", matchedSpan),
+			Snippet:     extractLine(source, line),
+			CWE:         "CWE-770",
+			OWASP:       "A04",
+			Detection:   "regex",
+		})
+	}
+	return out
+}
+
+// scanUnboundedFetch — 0.5.4 addition.
+// Catches `fetch(<arg with args.X>, ...)` calls that omit the
+// `signal:` option in their opts object. Used to detect tool-side
+// streaming-fetch patterns where an attacker-controlled URL can pin
+// a long-lived connection that the agent loop reads via for-await.
+// CWE-770 (uncontrolled resource consumption).
+func scanUnboundedFetch(relPath, source string) []Finding {
+	var out []Finding
+	seen := make(map[int]bool)
+	for _, loc := range unboundedFetchRe.FindAllStringIndex(source, -1) {
+		matchStart := loc[0]
+		if inNonCodeContext(source, matchStart) {
+			continue
+		}
+		// Find the matching close-paren for this fetch( call so we can
+		// check whether signal: appears anywhere in the call. Naive
+		// paren-balancing — sufficient for the common cases. Bail at
+		// 500 chars to avoid quadratic blowup on giant calls.
+		depth := 0
+		end := matchStart
+		for i := matchStart; i < len(source) && i < matchStart+500; i++ {
+			if source[i] == '(' {
+				depth++
+			} else if source[i] == ')' {
+				depth--
+				if depth == 0 {
+					end = i + 1
+					break
+				}
+			}
+		}
+		callBody := source[loc[0]:end]
+		if signalInFetchOptsRe.MatchString(callBody) {
+			continue
+		}
+		line := lineNumberAt(source, matchStart)
+		if seen[line] {
+			continue
+		}
+		seen[line] = true
+		out = append(out, Finding{
+			FilePath:    relPath,
+			LineStart:   line,
+			LineEnd:     line,
+			Category:    "unbounded-stream",
+			Severity:    unboundedStreamSeverity,
+			Title:       "fetch() without signal: option, URL from tool args",
+			Explanation: "An LLM tool-callable function passes `args.url` (or another args.X field) to `fetch(...)` without a `signal:` AbortController option. An attacker-controlled URL can point at a slow endpoint and pin the agent's network read indefinitely, holding tokens and a worker slot. Pass `signal: controller.signal` and abort the controller on a timeout / disconnect.",
+			ContentHash: hashAiAppFinding(relPath, line, "unbounded-stream", source[loc[0]:loc[1]]),
+			Snippet:     extractLine(source, line),
+			CWE:         "CWE-770",
+			OWASP:       "A04",
+			Detection:   "regex",
+		})
+	}
+	return out
+}
+
+// scanHtmlKeyEmbed — 0.5.4 addition.
+// Catches server-rendered HTML that embeds an LLM provider API key
+// as a template-literal substitution inside a res.send(`<...>`) call.
+// Semantically equivalent to NEXT_PUBLIC_-style client exposure but
+// hidden behind server-rendered HTML.
+func scanHtmlKeyEmbed(relPath, source string) []Finding {
+	var out []Finding
+	for _, loc := range htmlKeyEmbedRe.FindAllStringIndex(source, -1) {
+		matchStart := loc[0]
+		if inNonCodeContext(source, matchStart) {
+			continue
+		}
+		span := source[loc[0]:loc[1]]
+		// Point at the line of the actual leak (the process.env.X line)
+		// rather than the containing res.send keyword.
+		offsetWithinMatch := strings.Index(span, "process.env.")
+		line := lineNumberAt(source, matchStart)
+		if offsetWithinMatch > 0 {
+			line = lineNumberAt(source, matchStart+offsetWithinMatch)
+		}
+		out = append(out, Finding{
+			FilePath:    relPath,
+			LineStart:   line,
+			LineEnd:     line,
+			Category:    "client-side-llm-key",
+			Severity:    clientLlmKeySeverity,
+			Title:       "Server-rendered HTML embeds LLM provider key",
+			Explanation: "A `res.send` call embeds `process.env.X_API_KEY` (or similar) into a backtick-quoted HTML template that ships to the browser. The key reaches the page DOM as an attribute or text node — semantically the same exposure as NEXT_PUBLIC_, hidden behind server-rendered HTML. Anyone who loads the page reads the key via view-source. Refactor so the upstream provider call happens server-side and the response (not the credential) ships to the client.",
+			ContentHash: hashAiAppFinding(relPath, line, "client-side-llm-key", span),
+			Snippet:     extractLine(source, line),
+			CWE:         "CWE-522",
+			OWASP:       "A02",
+			Detection:   "regex",
+		})
+	}
+	return out
+}
+
+// scanKeyInResponse fires on a server route that returns an LLM
+// provider API key inside the JSON response body. The leak shape is
+// semantically equivalent to shipping the key in the client bundle —
+// it hides behind a server endpoint instead of inlining into the bundle.
+// Categorised under client-side-llm-key since the effect is identical
+// (key reaches the browser).
+func scanKeyInResponse(relPath, source string) []Finding {
+	var out []Finding
+	for _, loc := range keyInResponseRe.FindAllStringIndex(source, -1) {
+		matchStart := loc[0]
+		if inNonCodeContext(source, matchStart) {
+			continue
+		}
+		span := source[loc[0]:loc[1]]
+		// Point the finding at the line of the actual leak (the
+		// `apiKey: process.env.X_API_KEY` line) rather than the
+		// containing Response.json/res.json keyword.
+		offsetWithinMatch := strings.Index(span, "process.env.")
+		line := lineNumberAt(source, matchStart)
+		if offsetWithinMatch > 0 {
+			line = lineNumberAt(source, matchStart+offsetWithinMatch)
+		}
+		out = append(out, Finding{
+			FilePath:    relPath,
+			LineStart:   line,
+			LineEnd:     line,
+			Category:    "client-side-llm-key",
+			Severity:    clientLlmKeySeverity,
+			Title:       "Server route returns LLM provider key in response body",
+			Explanation: "A route handler returns a process.env.*_API_KEY (or *_TOKEN / *_SECRET) value in its JSON response. Anyone who can reach the endpoint can read the key — the route is functionally a public credential dispenser. Even with auth gating, a single bug in the auth check exposes the key. Refactor so the route proxies the upstream API call instead of returning the credential.",
+			ContentHash: hashAiAppFinding(relPath, line, "client-side-llm-key", span),
+			Snippet:     extractLine(source, line),
+			CWE:         "CWE-522",
+			OWASP:       "A02",
 			Detection:   "regex",
 		})
 	}

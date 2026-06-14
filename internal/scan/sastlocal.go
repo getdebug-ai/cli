@@ -39,10 +39,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/getdebug-ai/cli/internal/localllm"
 )
@@ -63,9 +66,22 @@ type SastLocalOptions struct {
 	// Default 96 KiB — large enough for almost every hand-written source
 	// file, small enough that the model's context window isn't a problem.
 	MaxFileBytes int
+	// PerFileTimeout caps how long a single ChatJSON call may run before
+	// the scanner cancels it and moves on. FIX 13 (2026-06-06 dogfood):
+	// before this knob the only ceiling was the HTTP client's 10-minute
+	// timeout, so one stuck file could stall a whole run. Default 3 min
+	// — observed cost on qwen2.5-coder:7b is ~10s/file and deepseek-r1
+	// ~75s, leaving comfortable headroom while still catching runaways.
+	// Zero falls back to the default.
+	PerFileTimeout time.Duration
 	// Logf is an optional progress logger (printed to stderr by the CLI).
 	Logf func(format string, args ...any)
 }
+
+// SastLocalDefaultPerFileTimeout is the per-file timeout when none is set.
+// Exported because the cobra flag default referenced in cmd/analyze.go
+// has to stay in sync with this constant.
+const SastLocalDefaultPerFileTimeout = 3 * time.Minute
 
 // SastLocalResult summarises what the pass covered + emitted.
 type SastLocalResult struct {
@@ -111,6 +127,16 @@ type sastCategory struct {
 	cwe             string
 	owasp           string
 	defaultSeverity string // minimum severity floor — see sastSeverityRank
+	// Some categories overlap multiple CWE/OWASP buckets. Example:
+	// unsafe-tool-output covers both eval-style code injection (CWE-94 /
+	// A08:2021, Software/Data Integrity Failures, the LLM-as-untrusted-
+	// source angle) AND OS command injection when the sink is
+	// subprocess.run/spawn (CWE-78 / A03:2021, traditional injection).
+	// When set, the SARIF emitter surfaces both via
+	// `external/cwe/cwe-<n>` tags so GitHub Code Scanning, GitLab,
+	// and other consumers index the finding under both buckets.
+	secondaryCWE   string
+	secondaryOWASP string
 }
 
 // sastCategories — single source of truth. Adding a category here
@@ -141,7 +167,13 @@ var sastCategories = []sastCategory{
 	// ── AI-app patterns (ported from workers/src/security/llm-app-holistic.ts) ──
 	// Severity floors match the hosted definitions in workers/src/security/llm-app.ts.
 	{name: "prompt-injection", guide: "untrusted user input reaches an LLM prompt without validation (typically template-literal interpolation into content/prompt/query fields)", cwe: "CWE-94", owasp: "A03:2021", defaultSeverity: SeverityHigh},
-	{name: "unsafe-tool-output", guide: "agent tool output or LLM response flows to a code or shell sink (eval, Function, vm.runIn*, child_process.exec/spawn) without validation", cwe: "CWE-94", owasp: "A08:2021", defaultSeverity: SeverityCritical},
+	// Primary CWE is the broader code-injection parent (eval, Function,
+	// vm.runIn*) — that's the LLM-as-untrusted-source angle. Secondary
+	// CWE-78 covers the subprocess.run/spawn subset of the same category;
+	// traditional SAST tools (Bandit B602, Semgrep subprocess-shell-true)
+	// classify this hit as CWE-78, so emitting both lets cross-tool dedup
+	// in GitHub Code Scanning recognise the overlap.
+	{name: "unsafe-tool-output", guide: "agent tool output or LLM response flows to a code or shell sink (eval, Function, vm.runIn*, child_process.exec/spawn) without validation", cwe: "CWE-94", owasp: "A08:2021", secondaryCWE: "CWE-78", secondaryOWASP: "A03:2021", defaultSeverity: SeverityCritical},
 	{name: "pii-in-prompt", guide: "personal user data (email, phone, address, full user records via JSON.stringify) is sent to the LLM provider", cwe: "CWE-200", owasp: "A04:2021", defaultSeverity: SeverityHigh},
 	{name: "unsafe-role-merge", guide: "untrusted content placed in the LLM `system` role (OpenAI messages with role:'system', Anthropic top-level system parameter, LangChain SystemMessage)", cwe: "CWE-94", owasp: "A03:2021", defaultSeverity: SeverityHigh},
 	{name: "client-side-llm-key", guide: "LLM provider API key exposed to the browser bundle via NEXT_PUBLIC_, VITE_, REACT_APP_ env var, or hardcoded in a client component", cwe: "CWE-798", owasp: "A02:2021", defaultSeverity: SeverityCritical},
@@ -252,6 +284,9 @@ func ScanSastLocal(ctx context.Context, opts SastLocalOptions) (*SastLocalResult
 	if opts.MaxFileBytes <= 0 {
 		opts.MaxFileBytes = 96 * 1024
 	}
+	if opts.PerFileTimeout <= 0 {
+		opts.PerFileTimeout = SastLocalDefaultPerFileTimeout
+	}
 	if opts.Logf == nil {
 		opts.Logf = func(string, ...any) {}
 	}
@@ -317,10 +352,28 @@ func ScanSastLocal(ctx context.Context, opts SastLocalOptions) (*SastLocalResult
 		return res, nil
 	}
 
-	for i, c := range candidates {
-		if i >= opts.MaxFiles {
-			break
-		}
+	// FIX 11 (2026-06-06 dogfood): rank candidates by security relevance
+	// before the MaxFiles cap. The pre-fix order was alphabetical (the
+	// order WalkDir returns), so on crewAI the cap consumed all of
+	// `__init__.py`, `constants.py`, tracking scripts before reaching
+	// the actual auth/api/sql handlers — 75s/file on a 1.5b model
+	// meant the user paid the wall-clock cost without ever covering
+	// the dangerous files. Stable sort so ties (zero-score files) keep
+	// alphabetical order.
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return sastRelevanceScore(candidates[i].rel) > sastRelevanceScore(candidates[j].rel)
+	})
+
+	// Cap up-front so the progress meter and ETA know the universe
+	// they're working over (FIX 12 below).
+	toScan := candidates
+	if len(toScan) > opts.MaxFiles {
+		toScan = toScan[:opts.MaxFiles]
+	}
+	total := len(toScan)
+	scanStart := time.Now()
+
+	for i, c := range toScan {
 		raw, err := os.ReadFile(c.abs)
 		if err != nil {
 			res.FilesSkipped++
@@ -339,15 +392,36 @@ func ScanSastLocal(ctx context.Context, opts SastLocalOptions) (*SastLocalResult
 		numbered := numberLines(string(raw))
 		userMsg := fmt.Sprintf("File: %s\n\n%s\n%s\n%s",
 			c.rel, codeStartMarker, numbered, codeEndMarker)
-		opts.Logf("sast-local: %s\n", c.rel)
+		// FIX 12 (2026-06-06 dogfood): `[N/M] path · elapsed Ns ·
+		// ETA Ns` so a long --local-llm pass (12+ min wall clock on
+		// crewAI) doesn't leave the user wondering whether it's hung.
+		// ETA is undefined on the first file; show "—" until we have
+		// at least one timing sample.
+		elapsed := time.Since(scanStart).Round(time.Second)
+		etaStr := "—"
+		if i > 0 {
+			avg := time.Since(scanStart) / time.Duration(i)
+			eta := time.Duration(total-i) * avg
+			etaStr = eta.Round(time.Second).String()
+		}
+		opts.Logf("[%d/%d] %s · elapsed %s · ETA %s\n", i+1, total, c.rel, elapsed, etaStr)
 
-		text, err := opts.Client.ChatJSON(ctx, model, []localllm.Message{
+		// FIX 13: cap per-file wall-clock so one stuck response can't
+		// stall the whole pass. Loud failure mode — log the timeout
+		// explicitly so the user knows what got dropped.
+		fileCtx, fileCancel := context.WithTimeout(ctx, opts.PerFileTimeout)
+		text, err := opts.Client.ChatJSON(fileCtx, model, []localllm.Message{
 			{Role: "system", Content: system},
 			{Role: "user", Content: userMsg},
 		})
+		fileCancel()
 		if err != nil {
 			res.Errors++
-			opts.Logf("sast-local: %s — model error: %v\n", c.rel, err)
+			if errors.Is(err, context.DeadlineExceeded) {
+				opts.Logf("sast-local: %s — TIMEOUT after %s (raise --local-llm-per-file-timeout or swap to a faster model)\n", c.rel, opts.PerFileTimeout)
+			} else {
+				opts.Logf("sast-local: %s — model error: %v\n", c.rel, err)
+			}
 			continue
 		}
 
@@ -411,8 +485,10 @@ func toFinding(rel string, raw []byte, mf modelFinding, cat sastCategory) Findin
 		Explanation: explanation,
 		ContentHash: hex.EncodeToString(h[:16]),
 		Detection:   "local-llm",
-		CWE:         cat.cwe,
-		OWASP:       cat.owasp,
+		CWE:            cat.cwe,
+		OWASP:          cat.owasp,
+		SecondaryCWE:   cat.secondaryCWE,
+		SecondaryOWASP: cat.secondaryOWASP,
 	}
 }
 
@@ -483,4 +559,52 @@ func numberLines(source string) string {
 		}
 	}
 	return b.String()
+}
+
+// sastRelevanceScore ranks a candidate path by likely security-relevance.
+// FIX 11 (2026-06-06 dogfood): WalkDir hands files back in alphabetical
+// order, so an unranked MaxFiles cap (default 50) burned the budget on
+// `__init__.py`, `constants.py`, tracking scripts before reaching
+// auth/api/sql handlers. Heuristic-only, deliberately cheap — a real
+// AST analyzer would be overkill for picking 50 files out of a few
+// thousand. Positive keywords add 10, negative subtract 5; ties keep
+// alphabetical order via the stable sort in ScanSastLocal.
+func sastRelevanceScore(rel string) int {
+	lower := strings.ToLower(rel)
+	score := 0
+	for _, kw := range sastRelevantKeywords {
+		if strings.Contains(lower, kw) {
+			score += 10
+		}
+	}
+	for _, kw := range sastBoringKeywords {
+		if strings.Contains(lower, kw) {
+			score -= 5
+		}
+	}
+	return score
+}
+
+// Paths containing these substrings are more likely to host real
+// security issues — auth boundaries, IO sinks, request handling.
+var sastRelevantKeywords = []string{
+	"auth", "login", "session", "password", "secret", "token", "credential",
+	"jwt", "oauth", "permission", "role", "admin",
+	"handler", "controller", "router", "endpoint", "middleware", "route",
+	"api", "rpc", "graphql", "webhook",
+	"query", "sql", "db", "database", "repository", "model.py",
+	"exec", "subprocess", "shell", "command", "eval",
+	"upload", "download", "file", "path",
+	"request", "response", "http", "fetch", "client",
+	"deserialize", "serialize", "parse", "marshal", "unmarshal",
+	"sanitize", "escape", "validate",
+	"crypto", "hash", "sign", "verify", "random",
+}
+
+// Paths matching these are typically static data / generated code /
+// boilerplate — high alphabet rank, low SAST yield.
+var sastBoringKeywords = []string{
+	"__init__", "__main__", "constant", "types/", "/types.",
+	"schema.py", ".pb.go", ".gen.go", "generated", "mock",
+	"locale", "i18n", "migration",
 }

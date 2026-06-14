@@ -127,6 +127,103 @@ func TestSeverityToLevel_Mapping(t *testing.T) {
 	}
 }
 
+func TestWriteSARIF_MultiCWEPropagatesToTagsAndArrays(t *testing.T) {
+	// unsafe-tool-output is the canonical multi-CWE category: CWE-94 is the
+	// broader code-injection parent (eval/Function/vm.runIn*) and CWE-78 is
+	// the OS command-injection subset (subprocess.run/spawn). The SARIF
+	// emitter has to surface BOTH so GitHub Code Scanning indexes the
+	// finding under both CWE pages.
+	findings := []scan.Finding{
+		{
+			FilePath: "app.py", LineStart: 4, LineEnd: 4,
+			Category: "unsafe-tool-output", Severity: scan.SeverityCritical,
+			Title: "subprocess.run with model tool output", Explanation: "...",
+			ContentHash: "feedface0001",
+			CWE: "CWE-94", OWASP: "A08:2021",
+			SecondaryCWE: "CWE-78", SecondaryOWASP: "A03:2021",
+		},
+	}
+	var buf bytes.Buffer
+	if err := WriteSARIF(&buf, findings, "0.1.0"); err != nil {
+		t.Fatalf("WriteSARIF: %v", err)
+	}
+
+	var log struct {
+		Runs []struct {
+			Tool struct {
+				Driver struct {
+					Rules []struct {
+						Properties map[string]interface{} `json:"properties"`
+					} `json:"rules"`
+				} `json:"driver"`
+			} `json:"tool"`
+		} `json:"runs"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &log); err != nil {
+		t.Fatalf("invalid SARIF JSON: %v", err)
+	}
+	if len(log.Runs) != 1 || len(log.Runs[0].Tool.Driver.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got runs=%d rules=%d", len(log.Runs), len(log.Runs[0].Tool.Driver.Rules))
+	}
+	props := log.Runs[0].Tool.Driver.Rules[0].Properties
+
+	// `cwe` / `owasp` stay as the primary strings for back-compat.
+	if got, want := props["cwe"], "CWE-94"; got != want {
+		t.Errorf("cwe = %v, want %v", got, want)
+	}
+	if got, want := props["owasp"], "A08:2021"; got != want {
+		t.Errorf("owasp = %v, want %v", got, want)
+	}
+	// `cwes` / `owasps` arrays carry the full set when multi-valued.
+	cwes, _ := props["cwes"].([]interface{})
+	if len(cwes) != 2 || cwes[0] != "CWE-94" || cwes[1] != "CWE-78" {
+		t.Errorf("cwes = %v, want [CWE-94 CWE-78]", cwes)
+	}
+	owasps, _ := props["owasps"].([]interface{})
+	if len(owasps) != 2 || owasps[0] != "A08:2021" || owasps[1] != "A03:2021" {
+		t.Errorf("owasps = %v, want [A08:2021 A03:2021]", owasps)
+	}
+	// GitHub Code Scanning consumes `external/cwe/cwe-<n>` tags. Both
+	// CWEs MUST appear in the tags so the finding shows up under both
+	// CWE pages on the Security tab.
+	tags, _ := props["tags"].([]interface{})
+	var have94, have78 bool
+	for _, t := range tags {
+		switch t {
+		case "external/cwe/cwe-94":
+			have94 = true
+		case "external/cwe/cwe-78":
+			have78 = true
+		}
+	}
+	if !have94 || !have78 {
+		t.Errorf("expected both external/cwe/cwe-94 AND external/cwe/cwe-78 tags; got %v", tags)
+	}
+}
+
+func TestWriteSARIF_SingleCWE_OmitsArrayForms(t *testing.T) {
+	// Categories with a single CWE (the common case) should NOT emit the
+	// `cwes` / `owasps` array forms — `cwe` / `owasp` strings are enough,
+	// and adding redundant single-element arrays would just bloat the file.
+	findings := []scan.Finding{{
+		FilePath: "src/x.ts", LineStart: 1, LineEnd: 1,
+		Category: "sql-injection", Severity: scan.SeverityHigh,
+		Title: "SQLi", Explanation: "...",
+		ContentHash: "feedface0002",
+		CWE: "CWE-89", OWASP: "A03:2021",
+	}}
+	var buf bytes.Buffer
+	if err := WriteSARIF(&buf, findings, "0.1.0"); err != nil {
+		t.Fatalf("WriteSARIF: %v", err)
+	}
+	if strings.Contains(buf.String(), `"cwes"`) {
+		t.Errorf("single-CWE finding should not emit `cwes` array; got: %s", buf.String())
+	}
+	if strings.Contains(buf.String(), `"owasps"`) {
+		t.Errorf("single-OWASP finding should not emit `owasps` array; got: %s", buf.String())
+	}
+}
+
 func TestRuleID_Stable(t *testing.T) {
 	f := scan.Finding{Category: "secrets", Detection: "regex", Pattern: "AWS access key"}
 	if got, want := ruleID(f), "secrets/aws-access-key"; got != want {

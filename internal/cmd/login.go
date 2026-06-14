@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -132,15 +133,41 @@ func runLogin(cmd *cobra.Command, _ []string) error {
 // defaultAPIBaseURL prefers the env var, then the config file (if a previous
 // login already pinned one), then the production default. Letting the env
 // var override means CI / dev can point at staging without flags.
+//
+// FIX 14 (2026-06-06 dogfood): treat a localhost-pinned config as
+// non-sticky. The previous behaviour stuck `http://localhost:4000` in
+// `~/.getdebug/config.json` after any local dev login and then handed
+// that URL to every subsequent prod login — which silently failed to
+// reach api.getdebug.dev and forced users to `rm ~/.getdebug/config.json`
+// before they could authenticate against prod. The env var still wins
+// (CI + scripted dev), so explicit intent isn't punished; only the
+// implicit-stale-cache path falls back to prod.
 func defaultAPIBaseURL() string {
 	if v := strings.TrimSpace(os.Getenv("GETDEBUG_API_URL")); v != "" {
 		return v
 	}
 	cfg, _ := config.Load()
-	if cfg != nil && cfg.APIBaseURL != "" {
+	if cfg != nil && cfg.APIBaseURL != "" && !isLocalhostURL(cfg.APIBaseURL) {
 		return cfg.APIBaseURL
 	}
 	return "https://api.getdebug.dev"
+}
+
+// isLocalhostURL reports whether a base-URL points at the local machine.
+// Used by defaultAPIBaseURL to skip a sticky localhost pin. Parses the
+// URL and checks the hostname rather than prefix-matching to avoid
+// adversarial misclassification of `https://127.0.0.1.evil.example` and
+// similar subdomain trickery.
+func isLocalhostURL(s string) bool {
+	u, err := url.Parse(strings.TrimSpace(s))
+	if err != nil || u == nil {
+		return false
+	}
+	switch strings.ToLower(u.Hostname()) {
+	case "localhost", "127.0.0.1", "0.0.0.0", "::1":
+		return true
+	}
+	return false
 }
 
 // defaultClientName is what shows up on the approval page + in the dashboard's

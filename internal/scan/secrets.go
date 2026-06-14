@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -47,6 +48,21 @@ type Finding struct {
 	Snippet     string `json:"snippet,omitempty"`
 	CWE         string `json:"cwe,omitempty"`
 	OWASP       string `json:"owasp,omitempty"`
+	// Optional secondary CWE/OWASP for categories whose detection covers
+	// multiple top-level buckets — e.g. unsafe-tool-output is CWE-94
+	// (broader code injection) AND CWE-78 (OS command injection) for the
+	// subprocess subset. When set, the SARIF emitter surfaces both via
+	// `external/cwe/cwe-<n>` tags so consumers (GitHub Code Scanning,
+	// GitLab) index the finding under both.
+	SecondaryCWE   string `json:"secondaryCwe,omitempty"`
+	SecondaryOWASP string `json:"secondaryOwasp,omitempty"`
+	// Verification is populated by VerifyFindings (called from analyze.go
+	// when --verify is on). Always nil before the verification pass runs,
+	// and nil for non-secret findings. Pointer-shape so the absence of a
+	// verification record is distinguishable from a "no verifier"
+	// unknown — the JSON / SARIF output should omit the field in the
+	// first case but emit it in the second.
+	Verification *Verification `json:"verification,omitempty"`
 }
 
 // Mirrors workers/src/security/secrets.ts SKIP_DIRS.
@@ -134,8 +150,22 @@ var regexPatterns = []regexPattern{
 	{"Stripe restricted key", regexp.MustCompile(`\brk_(live|test)_[A-Za-z0-9]{24,}\b`)},
 	{"Paystack secret key", regexp.MustCompile(`\bsk_(live|test)_[a-f0-9]{40,}\b`)},
 	{"Slack token", regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{10,}\b`)},
-	{"OpenAI API key", regexp.MustCompile(`\bsk-(?:proj-)?[A-Za-z0-9_-]{40,}\b`)},
+	// FIX 8 (2026-06-06): Anthropic must precede OpenAI because
+	// `sk-ant-…` matches the more general OpenAI regex `\bsk-…` first
+	// otherwise — every Anthropic token in the wild was misclassified
+	// as OpenAI, then verifier-rejected (HTTP 401 from openai) and
+	// labelled REJECTED instead of the user's actual provider. Specific
+	// patterns before general ones across this table.
 	{"Anthropic API key", regexp.MustCompile(`\bsk-ant-(?:api03-)?[A-Za-z0-9_-]{40,}\b`)},
+	{"OpenAI API key", regexp.MustCompile(`\bsk-(?:proj-)?[A-Za-z0-9_-]{40,}\b`)},
+	// FIX 7 (2026-06-06): xAI / GitLab / npm. The verifiers in
+	// verify.go (providersByLabel) ship for these providers, but no
+	// detector regex existed — every real key from these providers
+	// was simply not surfaced. Labels must match the providersByLabel
+	// keys exactly so the verifier wires up.
+	{"xAI API key", regexp.MustCompile(`\bxai-[A-Za-z0-9]{32,}\b`)},
+	{"GitLab personal access token", regexp.MustCompile(`\bglpat-[A-Za-z0-9_\-]{20,}\b`)},
+	{"npm access token", regexp.MustCompile(`\bnpm_[A-Za-z0-9]{36}\b`)},
 	{"JWT", regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)},
 	{"Private key block", regexp.MustCompile(`-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP |)PRIVATE KEY-----`)},
 	{"SendGrid API key", regexp.MustCompile(`\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b`)},
@@ -146,7 +176,13 @@ var regexPatterns = []regexPattern{
 
 var (
 	keywordNear     = regexp.MustCompile(`(?i)\b(secret|token|password|passwd|api[_-]?key|access[_-]?key|auth|credential|priv(?:ate)?[_-]?key|client[_-]?secret)\b`)
-	placeholder     = regexp.MustCompile(`(?i)^(your[_-]|changeme|change[_-]me|replace[_-]?me|example|sample|dummy|xxx|todo|placeholder|insert[_-])`)
+	// FIX 1 (2026-06-06 crewAI dogfood): added `fake[_-]`, `mock[_-]`,
+	// `stub[_-]`. crewAI's `.env.test` uses `fake-password`, `mock_key`,
+	// `stub-token` as test fixture values; 5 critical FPs came from
+	// these shapes slipping through. The `[_-]` suffix keeps coverage
+	// tight (matches `fake-` / `fake_` but not `faker.io`-style
+	// substring hits at the start of an unrelated identifier).
+	placeholder     = regexp.MustCompile(`(?i)^(your[_-]|changeme|change[_-]me|replace[_-]?me|example|sample|dummy|xxx|todo|placeholder|insert[_-]|fake[_-]|mock[_-]|stub[_-])`)
 	valueCandidate  = regexp.MustCompile("[\"'`]?[A-Za-z0-9+/=_\\-\\.]{20,}[\"'`]?")
 	urlPrefix       = regexp.MustCompile(`^https?://`)
 	testFile        = regexp.MustCompile(`(?i)\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|py)$`)
@@ -178,8 +214,15 @@ var (
 // (per docFile above) are FP-shaped. Adding here is a tighter trade than
 // dropping the pattern entirely: regular code paths still flag, only
 // documentation matches are suppressed.
+//
+// `HuggingFace token` joined the set 2026-06-06 — getdebug's own
+// METHODOLOGY.md labels real-world tokens it found in other people's
+// public repos (so it can score detector recall against them), and
+// those literal hf_… strings tripped the regex inside the markdown
+// explanation paragraph. Routine offender, same shape as PEM in markdown.
 var docSuppressedPatterns = map[string]struct{}{
 	"Private key block": {},
+	"HuggingFace token": {},
 }
 
 // entropyScanEnabled mirrors the TS predicate of the same name. Pass 1
@@ -281,6 +324,12 @@ type Result struct {
 	ScannedFiles int
 	ScannedBytes int64
 	Truncated    bool // hit MAX_TOTAL_BYTES before finishing the walk
+	// TruncatedAt is the (rel-to-Workdir) path of the file whose size
+	// would have pushed the run over the byte budget. The CLI surfaces
+	// it so the user has an actionable anchor for `.getdebug-ignore`
+	// rather than the opaque "hit 20 MB cap" message. Empty when
+	// !Truncated.
+	TruncatedAt string
 }
 
 // ScanSecrets runs the two-pass secret detector across Workdir.
@@ -291,7 +340,12 @@ type Result struct {
 func ScanSecrets(opts ScanOptions) (*Result, error) {
 	res := &Result{}
 	seen := make(map[string]struct{})
-	if err := walkDir(opts.Workdir, opts.Workdir, opts.Ignore, opts.IgnoreRules, seen, res); err != nil {
+	// walkDir returns filepath.SkipAll when the cumulative byte budget
+	// is hit — that's Go's idiomatic "stop walking, we're done"
+	// sentinel, NOT a failure. Treat it as a clean truncation: the
+	// caller still gets every finding collected so far, with
+	// res.Truncated already set. Any other error is a real failure.
+	if err := walkDir(opts.Workdir, opts.Workdir, opts.Ignore, opts.IgnoreRules, seen, res); err != nil && !errors.Is(err, filepath.SkipAll) {
 		return res, err
 	}
 	return res, nil
@@ -373,6 +427,7 @@ func walkDir(root, dir string, ignore map[string]struct{}, rules *IgnoreRuleset,
 		}
 		if res.ScannedBytes+size > maxTotalBytes {
 			res.Truncated = true
+			res.TruncatedAt = rel
 			return filepath.SkipAll
 		}
 
@@ -402,6 +457,19 @@ func scanContent(content []byte, rel string, seen map[string]struct{}, out *[]Fi
 	runEntropy := entropyScanEnabled(rel)
 	inDoc := docFile.MatchString(rel)
 	lines := splitLines(content)
+	// FIX 2 (2026-06-06): for Python source files, pre-compute the set
+	// of lines inside `"""…"""` / `'''…'''` docstrings so the
+	// `Private key block` regex doesn't fire on PEM-shaped example
+	// values inside docstrings or doctest lines. The bench/realworld
+	// crewAI-getdebug fixture and several stdlib `ssl` / `cryptography`
+	// docstrings tripped this before. Narrow scope — non-PEM regex
+	// matches still fire normally in docstrings (a real `sk-…` in a
+	// docstring is still a leak).
+	var pyDocstring map[int]bool
+	isPython := strings.HasSuffix(strings.ToLower(rel), ".py")
+	if isPython {
+		pyDocstring = pythonDocstringLines(content)
+	}
 	for i, line := range lines {
 		if line == "" {
 			continue
@@ -409,6 +477,30 @@ func scanContent(content []byte, rel string, seen map[string]struct{}, out *[]Fi
 		lineNo := i + 1
 
 		// Pass 1: provider regex.
+		//
+		// FIX 8 (2026-06-06): patterns earlier in the table are MORE
+		// specific (Anthropic `sk-ant-…` precedes OpenAI `sk-…`). Track
+		// the character ranges already consumed on this line and skip
+		// any later-pattern match that overlaps a consumed range. Order
+		// alone didn't help because the loop walks every pattern and
+		// emits one finding per match — without occupancy tracking,
+		// `sk-ant-DDDD…` produced both an Anthropic AND an OpenAI
+		// finding, then the verifier rejected the OpenAI variant with
+		// HTTP 401 and the user thought their Anthropic key was burned.
+		consumed := make([]bool, len(line))
+		overlapsConsumed := func(m []int) bool {
+			for i := m[0]; i < m[1] && i < len(consumed); i++ {
+				if consumed[i] {
+					return true
+				}
+			}
+			return false
+		}
+		markConsumed := func(m []int) {
+			for i := m[0]; i < m[1] && i < len(consumed); i++ {
+				consumed[i] = true
+			}
+		}
 		for _, pat := range regexPatterns {
 			// Heroku UUID is over-broad alone; require "heroku" on the line.
 			if pat.label == "Heroku API key" && !herokuContextRe.MatchString(line) {
@@ -422,14 +514,28 @@ func scanContent(content []byte, rel string, seen map[string]struct{}, out *[]Fi
 					continue
 				}
 			}
+			// FIX 2: PEM-block markers inside Python docstrings or
+			// doctest lines (`>>> ...`, `... continuation`) are
+			// documentation examples. Narrow scope — only the
+			// `Private key block` pattern is suppressed, so a real
+			// `sk-…` accidentally pasted into a docstring still fires.
+			if isPython && pat.label == "Private key block" {
+				if pyDocstring[lineNo] || isPythonDoctestLine(line) {
+					continue
+				}
+			}
 			matches := pat.re.FindAllStringIndex(line, -1)
 			for _, m := range matches {
+				if overlapsConsumed(m) {
+					continue
+				}
 				matched := trimMatch(line[m[0]:m[1]])
 				hash := hashFinding(rel, strconv.Itoa(lineNo), "secrets", "regex", pat.label, matched)
 				if _, dup := seen[hash]; dup {
 					continue
 				}
 				seen[hash] = struct{}{}
+				markConsumed(m)
 				*out = append(*out, Finding{
 					FilePath:    rel,
 					LineStart:   lineNo,

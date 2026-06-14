@@ -175,3 +175,33 @@ func TestEveryCategoryHasDefaultSeverity(t *testing.T) {
 		}
 	}
 }
+
+// FIX 11 (crewAI dogfood 2026-06-06): security-relevance ranking. The
+// default MaxFiles cap is small enough that walk-order matters — these
+// tests pin the keyword heuristic so a regression doesn't silently
+// re-bias the cap toward `__init__.py` + constants files.
+func TestSastRelevanceScore_RanksSecurityPathsAboveBoilerplate(t *testing.T) {
+	cases := []struct {
+		path        string
+		minScore    int // expect at least this many points
+		description string
+	}{
+		{"api/routes/auth_login.py", 30, "auth + login + route + api: 4 hits"},
+		{"src/handlers/sql_query.go", 30, "handler + sql + query: 3 hits"},
+		{"internal/auth/token.go", 20, "auth + token: 2 hits"},
+		{"src/__init__.py", -5, "init file: 1 negative hit"},
+		{"types/constants.py", -10, "types/ + constant: 2 negative hits"},
+	}
+	for _, tc := range cases {
+		got := sastRelevanceScore(tc.path)
+		if got < tc.minScore {
+			t.Errorf("sastRelevanceScore(%q) = %d, want >= %d (%s)", tc.path, got, tc.minScore, tc.description)
+		}
+	}
+
+	// And the relative ordering invariant: auth/login files MUST outrank
+	// __init__ files. Pre-FIX-11 they did not — alphabetical wins.
+	if a, b := sastRelevanceScore("auth.py"), sastRelevanceScore("__init__.py"); a <= b {
+		t.Errorf("auth.py (%d) should outrank __init__.py (%d)", a, b)
+	}
+}

@@ -1,5 +1,250 @@
 # Changelog
 
+## 0.5.9 — 2026-06-14
+
+Two precision/correctness fixes ahead of the Phase 1.8 §3 outreach pass.
+No new detectors — both tighten existing behaviour so the product does in
+code what the docs claim.
+
+### Fixed
+
+- **`--local-llm` now defaults `--verify` off (air-gap honoured in code,
+  not just copy).** Local mode runs the whole pipeline against a localhost
+  Ollama and promises zero outbound calls, but the secret scanner still
+  made authenticated whoami calls to provider endpoints (`api.openai.com`,
+  `api.stripe.com`, …) — shipping the candidate key off the machine and
+  breaking the air-gap promise. Verification now defaults OFF under
+  `--local-llm` unless the user explicitly opts in with `--verify` or
+  `--only-verified`. (`internal/cmd/analyze.go`)
+
+- **CrewAI URM detectors gated on a CrewAI import.** The 0.5.6
+  unrestricted-message-role detectors (`backstory=` / `goal=` / `role=`
+  patterns) fired on any `role=<var>` kwarg in general Python — `role=None`,
+  `role=getattr(msg, "role")` — producing 4 false positives on simonw/llm,
+  which uses no CrewAI. All three CrewAI detectors now require a
+  case-insensitive `crewai` marker in the file. Separately,
+  `scanPyDynamicRole` now skips attribute-access role values
+  (`{"role": message.role}`, `{"role": self.role}`) — those read the message
+  object's own controlled role field, not a request-supplied variable.
+  simonw/llm: 14 → 7 findings; it is now the regression fixture.
+  (`internal/scan/aiapp_regex_py.go`)
+
+## 0.5.8 — 2026-06-12
+
+Cross-language AI-app detector waves from the CodeSecBench Tier C
+calibration arc (cycles 4–7, bench builds 0.5.5 → 0.5.8). Eight
+app-shaped public targets across four languages drove the detector
+work; the corpus and its labels are public at
+[getdebug-ai/codesecbench-truth](https://github.com/getdebug-ai/codesecbench-truth)
+and written up at [codesecbench.org](https://codesecbench.org).
+
+### Added
+
+- **Python FastAPI / async wave (0.5.5).** Nine detectors in
+  `aiapp_regex_py.go`: streaming handlers with no disconnect/cleanup
+  guard (function-scoped, comment/docstring-stripped), httpx stream
+  without timeout, `subprocess(shell=True)` / `os.system` tool sinks,
+  f-string SQL, dynamic message role, persona-file system injection,
+  key-in-response, RAG `.join` concat, and full-DB-row-into-prompt.
+- **CrewAI agent wave (0.5.6).** Three detectors reaching the `Agent()`
+  constructor surface: interpolated `backstory`/`goal`, backstory loaded
+  from a file, and a request-derived `role=` kwarg (allowlist-suppressed).
+- **Go AI-app path (0.5.7).** New `aiapp_regex_go.go` + `.go` dispatch,
+  gated on an LLM-SDK marker so non-AI Go (including this CLI) stays
+  silent. Twelve detectors across all six categories — fmt.Sprintf /
+  strings.Join prompts, `anthropic.F(System:)`, openai-go `Role:`,
+  os/exec, json.Marshal(user), `NewStreaming(context.Background())`.
+- **Ruby on Rails path (0.5.8).** New `aiapp_regex_rb.go` + `.rb`
+  dispatch, gated on a case-insensitive LLM-SDK marker. Fourteen
+  detectors — `#{}` interpolation, `role: params[:role]`, backtick
+  exec, `File.read("...#{}")`, `user.to_json`, `ActionController::Live`,
+  `OpenAI::Client.new` without `request_timeout`.
+
+### Notes
+
+- All new detectors are extension-gated; existing JS/TS/Python behaviour
+  is unchanged (verified zero-regression across the corpus). Result:
+  corpus recall ~48% → 76%, with 100% precision on every target.
+- The four early JS/TS targets (#1–#4) carry the residual FN tail; a
+  future pass widens their point labels to spans.
+
+## 0.5.1 — 2026-06-07
+
+The Phase 1.8 §2 self-dogfood pass — 17 fixes catalogued from a
+1,217-file Python run (crewAIInc/crewAI) and a full MCP round-trip
+against the `debug` org itself, shipped before the §3 outreach
+arc. Two of the three P0s collapse the false-positive rate on
+real-world Python repos; the third makes `--fail-on=verified-*`
+into the high-precision lane it always claimed to be.
+
+### Changed
+
+- **`--fail-on=verified-*` is now an inclusion gate.** Previously
+  the only `verified-*`-specific behaviour was skipping
+  `status=invalid` secrets, so `verified-high` matched plain
+  `high` on every real repo — the precision lane was inert. A
+  finding now counts under `verified-*` only when the detector
+  produced an affirmative signal (provider 2xx for secrets;
+  reachability + judge-pass land as the workers-context
+  pipeline reaches the CLI). On crewAI: `verified-high` drops
+  from blocking 28 to blocking 0 (no live secrets), matching
+  the user expectation.
+- **TTY output surfaces verifier badges.** Per-row
+  `[LIVE]` / `[REJECTED]` / `[UNVERIFIED]` next to the severity
+  badge, plus a bottom-of-output `Verification: N LIVE · N
+  REJECTED · N UNVERIFIED` summary line. Same vocabulary as the
+  hosted MCP. Empty when no findings carry verification data, so
+  plain `analyze .` (no `--verify`) stays uncluttered.
+- **Anthropic precedes OpenAI in the secrets regex table.**
+  Anthropic tokens (`sk-ant-…`) now classify as Anthropic instead
+  of being double-tagged as OpenAI and verifier-rejected with
+  HTTP 401 from openai.com. The scan loop additionally tracks
+  per-line consumed character ranges so one token can produce
+  only one finding.
+- **Default behaviour of `getdebug undo`:** the
+  `.getdebug-backup-<TS>/` directory is removed after a
+  successful restore. Pass `--keep-backup` to retain it for an
+  audit trail or diff.
+- **20 MB truncation hint** is multi-line + actionable.
+  Surfaces the path the walk stopped at and points at
+  `.getdebug-ignore` + a narrow-scope re-run instead of the old
+  one-liner.
+
+### Added
+
+- **Detector regexes for xAI (`xai-`), GitLab (`glpat-`),
+  npm (`npm_`)** — verifiers shipped in 0.5.0 but no detector,
+  so real keys from those providers were silently missed.
+- **`--local-llm-per-file-timeout`** — explicit per-file cap
+  (default 3 min) on Ollama chat calls during the local SAST
+  pass. Pre-fix ceiling was the localllm HTTP client's 10 min,
+  so one stuck file could pin a whole run.
+- **`--keep-backup`** on `getdebug undo` (see Changed above).
+- **Progress meter on `--local-llm`** — per-file
+  `[N/M] path · elapsed Ns · ETA Ns` log line so a 12+ min
+  qwen-1.5b run doesn't leave the user wondering whether it's
+  hung.
+
+### Fixed
+
+- **`message` and `query` removed from the Python prompt-injection
+  identifier set.** Was firing on every `self.message = f"…"` in
+  custom Exception subclasses + every `query = "SELECT …" + …`
+  SQL builder. 14 of 22 HIGH false positives on crewAI came from
+  this single pair.
+- **`streamTruePyRe` requires kwarg context.** Now matches
+  `(stream=True` and `,stream=True` only — kills FPs on
+  `self.stream = True` attribute assignments + bare `stream = True`
+  variable bindings. 9 medium FPs on crewAI.
+- **PEM-block detector respects Python docstrings + doctest
+  lines.** A `-----BEGIN PRIVATE KEY-----` marker inside a `"""…"""`
+  triple-quote or on a `>>> …` doctest line no longer surfaces.
+  Narrow — non-PEM patterns still fire in docstrings (a real
+  `sk-…` accidentally pasted into a docstring is still a leak).
+- **Placeholder regex covers fake/mock/stub-prefixed values.**
+  crewAI's `.env.test` had 5 critical FPs on `fake-password` /
+  `mock_key` / `stub-token`-shaped values.
+- **Local-SAST file selection is ranked by security-relevance**
+  before the MaxFiles cap. Pre-fix WalkDir gave alphabetical
+  order, so the cap burned on `__init__.py` + constants before
+  reaching auth/sql handlers. Heuristic keyword score + stable
+  sort.
+- **Localhost API URLs in `~/.getdebug/config.json` are no longer
+  sticky** as the default for `getdebug login`. The fallback now
+  skips a localhost pin and reverts to the prod default; users
+  no longer have to `rm ~/.getdebug/config.json` after dev
+  testing. `GETDEBUG_API_URL` still wins for explicit intent.
+- **`getdebug fix . --local-only`** accepts `.` (and `./`,
+  `./.`). Every other command treated `.` as the workdir alias;
+  rejecting it only here was a paper cut.
+
+### MCP
+
+- **`GET /v1/findings/:id` exists.** The `get_finding` MCP tool
+  was calling a route that didn't exist, so every list→drill
+  flow died on the second step. The handler accepts the new
+  stable id, the legacy `finding_<runId>_<hash>` form, and a
+  bare content hash; falls back to content-hash latest-row when
+  exact match misses. Returns 404 (not 403) on cross-org so the
+  route isn't a probing oracle.
+- **Stable finding ids on the wire.** The DB id rotated every
+  scan (append-only `findings` table); `list_fixes` references
+  went stale on the next scan and any cached agent id 404'd.
+  All list / detail / run / architectural routes now surface
+  `finding_<projectId>_<contentHash>` — same for the embedded
+  finding ref in `list_fixes`. Legacy ids still resolve on the
+  input side for backwards compat. MCP server code unchanged —
+  same npm artifact, just gets stable ids now.
+
+## 0.5.0 — 2026-06-06
+
+The 700-FP cleanup — three additions that move getdebug's default
+output from "wall of noise" to "ready to action" on real customer
+repos. On the debug repo itself: **770 → 67 findings (-91%)**;
+`--fail-on=high` CI gate goes from blocking ~756 to blocking 12.
+On `directus/directus` as a customer-shape control: 45 dep-CVE
+findings → `--fail-on=high` drops from blocking 5 to blocking 1
+(the one direct-and-actionable CVE).
+
+### Added
+
+- **Import-level dep-CVE reachability** — `npm audit` /
+  `pnpm audit` / `pip-audit` / `osv-scanner` flag every transitive
+  package in the lockfile; we now record whether your source
+  actually imports the affected package. Transitive-only findings
+  are demoted one severity step (never dropped) so they step out
+  of the gate without disappearing from the report. JS/TS,
+  Python, Go covered.
+  - New `--fail-on=reachable-critical` / `reachable-high`
+    thresholds skip transitive-only dep-CVEs at the gate.
+- **Secret verification (`--verify`, on by default)** — after
+  the regex pass, getdebug makes one read-only request per
+  distinct candidate against the provider's whoami endpoint
+  and records `valid` / `invalid` / `unknown` on the finding.
+  10 providers covered today: **OpenAI, Anthropic, xAI, GitHub PAT
+  (classic + fine-grained), Stripe, Paystack, GitLab, npm,
+  SendGrid, Slack**. 5s timeout, 5 req/s per-provider rate limit,
+  identical keys deduped per run. AWS / GCP / Azure deferred —
+  SigV4 + JWT signing is a separate hardening project.
+  - New `--only-verified` flag — drops `invalid` from the report.
+    `unknown` always still surfaces; a provider outage can't
+    silently mask a real leak.
+  - New `--fail-on=verified-critical` / `verified-high`
+    thresholds — the tightest gate available, requires both
+    reachable AND verified.
+
+### Changed
+
+- **Ignore-rule parity sweep** — the hosted scanner now applies
+  the same `BuiltInIgnorePatterns()` matrix the CLI does, plus
+  three new groups that close the noisiest gaps:
+  - Local-dev env overrides (`.env.local`, `.env.<env>.local`).
+    `.env` / `.env.production` still scan — a committed real key
+    there remains a real leak.
+  - Scanner output / bundled fixture data (`bench/results/*.json`,
+    `bench-fixtures.json`, `coverage/`, `.gstack/`,
+    `.vulnhuntr_checkpoint/`, `.nyc_output/`).
+  - Test scaffolding (the existing CLI list, now also applied
+    hosted-side).
+- **HuggingFace tokens in markdown** join the doc-suppression
+  list (Rule B extension) — bench's `METHODOLOGY.md` was
+  flagging the labelled-corpus hf\_… strings as fresh leaks.
+- **Local-only DB-URL placeholder check** — `user:user@localhost`
+  and RFC-1918 / `127.0.0.1` hosts no longer trigger a "Database
+  URL with inline credentials" critical. The repeated-credential
+  signal alone is never a real prod cred; combined with localhost
+  it's conclusive.
+- **Removed duplicated `Hugging Face token` regex** — second
+  pattern with 30+-char matching produced a duplicate finding on
+  every real `hf_…` token. Kept the conservative 34+ form.
+
+### Fixed
+
+- **`go.sum` joins the lockfile skip list** — `h1:` / `h2:`
+  content-address hashes were tripping the entropy pass on
+  Go monorepos. CLI had it; the hosted secret scanner was
+  missing it.
+
 ## 0.4.0 — 2026-06-05
 
 Two substantial additions: **Python AI-app regex prefilters** (same

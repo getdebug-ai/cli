@@ -15,17 +15,20 @@ import (
 )
 
 var (
-	analyzeNoGitignore  bool
+	analyzeNoGitignore      bool
 	analyzeNoDefaultIgnores bool
-	analyzeWatch        bool
-	analyzeCI           bool
-	analyzeFailOn       string
-	analyzeSARIF        string
-	analyzeJSON         bool
-	analyzeQuiet        bool
-	analyzeLocalLLM     bool
-	analyzeLocalLLMModel string
-	analyzeLocalLLMMax  int
+	analyzeWatch            bool
+	analyzeCI               bool
+	analyzeFailOn           string
+	analyzeSARIF            string
+	analyzeJSON             bool
+	analyzeQuiet            bool
+	analyzeLocalLLM         bool
+	analyzeLocalLLMModel    string
+	analyzeLocalLLMMax      int
+	analyzeLocalLLMTimeout  time.Duration
+	analyzeVerify           bool
+	analyzeOnlyVerified     bool
 )
 
 // ErrCIThresholdExceeded is returned by runAnalyze when --ci is set and at
@@ -36,12 +39,17 @@ var ErrCIThresholdExceeded = errors.New("getdebug: ci threshold exceeded")
 
 // validFailOnLevels mirrors the docs: critical | high | medium | low | any.
 // "any" means anything above `info` — fail on every concrete finding.
+// `verified-critical` / `verified-high` are the opt-in cousins of
+// `critical` / `high` — same severity bucket, but skip secret findings
+// whose verification status is `invalid`. Requires --verify (default on).
 var validFailOnLevels = map[string]struct{}{
-	"critical": {},
-	"high":     {},
-	"medium":   {},
-	"low":      {},
-	"any":      {},
+	"critical":          {},
+	"high":              {},
+	"medium":            {},
+	"low":               {},
+	"any":               {},
+	"verified-critical": {},
+	"verified-high":     {},
 }
 
 var analyzeCmd = &cobra.Command{
@@ -95,7 +103,7 @@ func init() {
 		"scan test files / fixtures / snapshots the CLI excludes by default (**/*.test.*, **/*_test.go, **/__tests__/**, etc.)")
 	analyzeCmd.Flags().BoolVar(&analyzeWatch, "watch", false, "re-analyze on file changes (Phase 2 — not yet implemented)")
 	analyzeCmd.Flags().BoolVar(&analyzeCI, "ci", false, "exit non-zero on findings at or above --fail-on threshold")
-	analyzeCmd.Flags().StringVar(&analyzeFailOn, "fail-on", "high", "minimum severity that fails the build under --ci: critical|high|medium|low|any")
+	analyzeCmd.Flags().StringVar(&analyzeFailOn, "fail-on", "high", "minimum severity that fails the build under --ci: critical|high|medium|low|any|verified-critical|verified-high")
 	analyzeCmd.Flags().StringVar(&analyzeSARIF, "sarif", "", "write SARIF 2.1.0 results to this path (for GitHub Code Scanning)")
 	analyzeCmd.Flags().BoolVar(&analyzeJSON, "json", false, "emit findings as newline-delimited JSON instead of the table")
 	analyzeCmd.Flags().BoolVar(&analyzeQuiet, "quiet", false, "suppress the scan-progress banner")
@@ -105,6 +113,16 @@ func init() {
 		"Ollama model for --local-llm (default: qwen2.5-coder:7b). Examples: deepseek-r1:7b, llama3.1:8b")
 	analyzeCmd.Flags().IntVar(&analyzeLocalLLMMax, "local-llm-max-files", 0,
 		"cap files sent to the local model in one scan (default 50). Higher = more coverage, longer wall-clock.")
+	// FIX 13 (2026-06-06 dogfood): explicit per-file wall-clock cap so
+	// a stuck model response (or a brutally slow model on a complex
+	// file) doesn't pin the whole run. Default 3 min — see
+	// scan.SastLocalDefaultPerFileTimeout for the rationale.
+	analyzeCmd.Flags().DurationVar(&analyzeLocalLLMTimeout, "local-llm-per-file-timeout", 0,
+		"per-file timeout for --local-llm calls (default 3m). Raise on slow models (deepseek-r1) or lower on faster ones.")
+	analyzeCmd.Flags().BoolVar(&analyzeVerify, "verify", true,
+		"after the secret scan, make one authenticated GET per distinct candidate key against the provider (OpenAI / Anthropic / xAI / GitHub / Stripe / Paystack) and record valid|invalid|unknown. Makes outbound calls, so it is auto-disabled under --local-llm (air-gap mode); also disable for air-gapped CI with --verify=false")
+	analyzeCmd.Flags().BoolVar(&analyzeOnlyVerified, "only-verified", false,
+		"hide secret findings whose verification returned `invalid`. Implies --verify. Does NOT silently drop unknown results — those still surface so a provider outage can't mask a real leak.")
 }
 
 func runAnalyze(cmd *cobra.Command, args []string) error {
@@ -112,7 +130,17 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 		return errors.New("--watch is not yet implemented (Phase 2)")
 	}
 	if _, ok := validFailOnLevels[analyzeFailOn]; !ok {
-		return fmt.Errorf("--fail-on=%q is not one of: critical, high, medium, low, any", analyzeFailOn)
+		return fmt.Errorf("--fail-on=%q is not one of: critical, high, medium, low, any, verified-critical, verified-high", analyzeFailOn)
+	}
+
+	// Local mode is an air-gap promise: --local-llm runs the whole pipeline
+	// against a localhost Ollama and must make NO outbound calls. Secret
+	// verification hits external provider whoami endpoints (api.openai.com,
+	// api.stripe.com, …) and would ship the candidate key off the machine,
+	// breaking that promise. So default verification OFF in local mode — unless
+	// the user explicitly opted in via --verify or --only-verified.
+	if analyzeLocalLLM && !cmd.Flags().Changed("verify") && !analyzeOnlyVerified {
+		analyzeVerify = false
 	}
 
 	path := "."
@@ -157,12 +185,29 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 	elapsed := time.Since(start)
 
 	if !analyzeQuiet {
-		hint := ""
+		fmt.Fprintf(cmd.ErrOrStderr(), "scanned %d files in %s\n",
+			res.ScannedFiles, elapsed.Round(time.Millisecond))
+		// FIX 5 (2026-06-06 dogfood): actionable truncation hint.
+		// Pre-fix message was "hit 20 MB total-bytes cap; rerun on a
+		// smaller subset for full coverage" — accurate but vague. Now
+		// the CLI names the file the walk stopped at AND points at the
+		// existing `.getdebug-ignore` mechanism users can use to
+		// exclude the heavy subtree. Multi-line so the actionable
+		// part doesn't get lost when the user scrolls.
 		if res.Truncated {
-			hint = " (hit 20 MB total-bytes cap; rerun on a smaller subset for full coverage)"
+			fmt.Fprintf(cmd.ErrOrStderr(), "  ⚠ hit 20 MB total-bytes cap")
+			if res.TruncatedAt != "" {
+				fmt.Fprintf(cmd.ErrOrStderr(), " — walk stopped at %s\n", res.TruncatedAt)
+			} else {
+				fmt.Fprintln(cmd.ErrOrStderr())
+			}
+			fmt.Fprintln(cmd.ErrOrStderr(),
+				"    add the heavy subtree to .getdebug-ignore (e.g. `bench/`, `fixtures/`) or rerun on a smaller path:")
+			fmt.Fprintln(cmd.ErrOrStderr(),
+				"      getdebug analyze ./src    # narrow the scope")
+			fmt.Fprintln(cmd.ErrOrStderr(),
+				"      echo 'bench/' >> .getdebug-ignore   # then re-run from the repo root")
 		}
-		fmt.Fprintf(cmd.ErrOrStderr(), "scanned %d files in %s%s\n",
-			res.ScannedFiles, elapsed.Round(time.Millisecond), hint)
 	}
 
 	// AI-app regex prefilters — deterministic, no LLM call. Runs on every
@@ -202,11 +247,12 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 		}
 		sastStart := time.Now()
 		sastRes, sastErr := scan.ScanSastLocal(cmd.Context(), scan.SastLocalOptions{
-			Workdir:     abs,
-			Client:      client,
-			Model:       model,
-			MaxFiles:    analyzeLocalLLMMax,
-			IgnoreRules: rules,
+			Workdir:        abs,
+			Client:         client,
+			Model:          model,
+			MaxFiles:       analyzeLocalLLMMax,
+			PerFileTimeout: analyzeLocalLLMTimeout,
+			IgnoreRules:    rules,
 			Logf: func(format string, args ...any) {
 				if !analyzeQuiet {
 					fmt.Fprintf(cmd.ErrOrStderr(), "  "+format, args...)
@@ -232,6 +278,19 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 	// preserving so the secrets pass + regex prefilter rows stay
 	// first in the report — those are the highest-confidence findings.
 	res.Findings = dedupeFindings(res.Findings)
+
+	// Secret verification: --only-verified implies --verify; treating
+	// either as on triggers the pass. We do it AFTER dedupe so the same
+	// key in two collapsed findings only verifies once.
+	if analyzeVerify || analyzeOnlyVerified {
+		if !analyzeQuiet {
+			fmt.Fprintf(cmd.ErrOrStderr(), "verifying secret findings against provider whoami endpoints …\n")
+		}
+		res.Findings = scan.VerifyFindings(cmd.Context(), res.Findings, scan.VerifyOptions{})
+		if analyzeOnlyVerified {
+			res.Findings = filterOutInvalidSecrets(res.Findings)
+		}
+	}
 
 	if analyzeSARIF != "" {
 		if err := writeSARIFFile(analyzeSARIF, res.Findings); err != nil {
@@ -291,25 +350,80 @@ func dedupeFindings(in []scan.Finding) []scan.Finding {
 	return out
 }
 
+// filterOutInvalidSecrets implements --only-verified: drop secret
+// findings whose verification status is `invalid`. `unknown` and `valid`
+// both surface — we never silently mask a real leak just because the
+// provider was down. Non-secret findings pass through unchanged.
+func filterOutInvalidSecrets(in []scan.Finding) []scan.Finding {
+	out := in[:0]
+	for _, f := range in {
+		if f.Category == "secrets" && f.Verification != nil && f.Verification.Status == scan.VerificationInvalid {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
 // countAtOrAbove counts findings at or above the threshold for `--fail-on`.
 // Lower severityRank = more severe, so we want findings whose rank <= the
 // threshold's rank.
+//
+// FIX 15 (2026-06-06 dogfood): `verified-*` is an INCLUSION gate, not a
+// subtraction. The previous logic only skipped secret findings whose
+// status was explicitly `invalid` — so anything `unknown` (no provider
+// configured, network blip, regex-only detector) still counted. On
+// crewAI, `--fail-on=verified-high` and `--fail-on=high` produced the
+// identical 28-finding fail. The high-precision lane disappeared.
+//
+// Inclusion semantics: a finding counts under `verified-*` only when its
+// detector produced an affirmative verification signal. See
+// affirmativelyVerified for the per-category rules.
 func countAtOrAbove(fs []scan.Finding, level string) int {
 	limit := thresholdRank(level)
+	wantsVerified := level == "verified-critical" || level == "verified-high"
 	n := 0
 	for _, f := range fs {
-		if report.SeverityRank(f.Severity) <= limit {
-			n++
+		if report.SeverityRank(f.Severity) > limit {
+			continue
 		}
+		if wantsVerified && !affirmativelyVerified(f) {
+			continue
+		}
+		n++
 	}
 	return n
 }
 
+// affirmativelyVerified reports whether a finding carries positive
+// evidence — provider 2xx for secrets today, with reachability + judge
+// signals added as the workers-context pipeline lands in the CLI. A
+// finding without an affirmative signal does NOT count under `verified-*`
+// (that is the whole point of the lane). Use plain `high` / `critical`
+// when you want the broad gate that includes unverified findings.
+func affirmativelyVerified(f scan.Finding) bool {
+	switch f.Category {
+	case "secrets":
+		// Provider returned 2xx for the key → real, live, leak-blast-radius
+		// high. `unknown` (provider down, no verifier configured) and
+		// `invalid` (regex matched but not a key shape) are NOT positive
+		// signals — they're absence of disproof, which is exactly what
+		// `verified-*` is designed to filter out.
+		return f.Verification != nil && f.Verification.Status == scan.VerificationValid
+	default:
+		// dependency-cve reachability + SAST judge-pass live in the
+		// workers-added context that the CLI does not yet read from
+		// hosted analyze. Until that wiring lands, conservative: no
+		// affirmative signal = no inclusion.
+		return false
+	}
+}
+
 func thresholdRank(level string) int {
 	switch level {
-	case "critical":
+	case "critical", "verified-critical":
 		return report.SeverityRank(scan.SeverityCritical)
-	case "high":
+	case "high", "verified-high":
 		return report.SeverityRank(scan.SeverityHigh)
 	case "medium":
 		return report.SeverityRank(scan.SeverityMedium)

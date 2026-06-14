@@ -55,13 +55,32 @@ func WriteTable(w io.Writer, findings []scan.Finding) {
 	for _, f := range fs {
 		badge := severityBadge(color, f.Severity)
 		loc := fmt.Sprintf("%s:%d", f.FilePath, f.LineStart)
-		fmt.Fprintf(w, "%s  %s  %s\n", badge, paint(color, "loc", loc), f.Title)
+		// FIX 6: render the verify badge (LIVE / REJECTED / UNVERIFIED)
+		// inline so the user sees provider-confirmed status without
+		// reading JSON. The renderer was silently dropping
+		// f.Verification before — verifier work was running, costing
+		// network round-trips, then never surfacing in the TTY output.
+		// Empty when the finding has no verification record (non-secret
+		// findings, or a run without --verify), so the row format stays
+		// the same in those cases.
+		vb := verifyBadge(color, f.Verification)
+		if vb != "" {
+			fmt.Fprintf(w, "%s  %s  %s  %s\n", badge, vb, paint(color, "loc", loc), f.Title)
+		} else {
+			fmt.Fprintf(w, "%s  %s  %s\n", badge, paint(color, "loc", loc), f.Title)
+		}
 		if f.Snippet != "" {
 			fmt.Fprintf(w, "       %s %s\n", paint(color, "dim", "↳"), truncate(f.Snippet, 100))
 		}
 	}
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, Summary(fs, color))
+	// Verification summary appears only when the run produced
+	// verification data — keeps the output uncluttered for plain
+	// `analyze .` runs that didn't pass --verify.
+	if line := VerifySummary(fs, color); line != "" {
+		fmt.Fprintln(w, line)
+	}
 }
 
 // Summary returns a one-line counts breakdown — used by both the table
@@ -100,6 +119,93 @@ func severityBadge(color bool, sev string) string {
 	default:
 		return "\x1b[1;90m" + label + "\x1b[0m"
 	}
+}
+
+// verifyBadge maps a Verification record to a short labeled badge —
+// LIVE (provider 2xx), REJECTED (provider 401/403), UNVERIFIED (provider
+// timeout / no verifier configured / no key in env). Same vocabulary the
+// hosted MCP server renders, so the CLI and dashboard speak the same
+// dialect. Returns "" when there's no verification record to show.
+func verifyBadge(color bool, v *scan.Verification) string {
+	if v == nil {
+		return ""
+	}
+	switch v.Status {
+	case scan.VerificationValid:
+		if color {
+			return "\x1b[1;41;97m LIVE \x1b[0m"
+		}
+		return "[LIVE]"
+	case scan.VerificationInvalid:
+		if color {
+			return "\x1b[1;90mREJECTED\x1b[0m"
+		}
+		return "[REJECTED]"
+	case scan.VerificationUnknown:
+		if color {
+			return "\x1b[33mUNVERIFIED\x1b[0m"
+		}
+		return "[UNVERIFIED]"
+	default:
+		return ""
+	}
+}
+
+// VerifySummary emits a single line counting LIVE / REJECTED /
+// UNVERIFIED across every finding that has a verification record. Used
+// for the bottom-of-output summary so a CI reviewer can see at a glance
+// whether the run found real keys or just unverified candidates. Returns
+// "" when no findings carry verification data — that keeps non-verify
+// runs uncluttered.
+func VerifySummary(fs []scan.Finding, color bool) string {
+	var live, rejected, unverified int
+	for _, f := range fs {
+		if f.Verification == nil {
+			continue
+		}
+		switch f.Verification.Status {
+		case scan.VerificationValid:
+			live++
+		case scan.VerificationInvalid:
+			rejected++
+		case scan.VerificationUnknown:
+			unverified++
+		}
+	}
+	if live+rejected+unverified == 0 {
+		return ""
+	}
+	parts := []string{}
+	parts = append(parts, fmt.Sprintf("%d %s", live, paintVerify(color, scan.VerificationValid)))
+	parts = append(parts, fmt.Sprintf("%d %s", rejected, paintVerify(color, scan.VerificationInvalid)))
+	parts = append(parts, fmt.Sprintf("%d %s", unverified, paintVerify(color, scan.VerificationUnknown)))
+	return fmt.Sprintf("Verification: %s", strings.Join(parts, " · "))
+}
+
+func paintVerify(color bool, s scan.VerificationStatus) string {
+	label := ""
+	switch s {
+	case scan.VerificationValid:
+		label = "LIVE"
+	case scan.VerificationInvalid:
+		label = "REJECTED"
+	case scan.VerificationUnknown:
+		label = "UNVERIFIED"
+	default:
+		return string(s)
+	}
+	if !color {
+		return label
+	}
+	switch s {
+	case scan.VerificationValid:
+		return "\x1b[1;31m" + label + "\x1b[0m"
+	case scan.VerificationInvalid:
+		return "\x1b[90m" + label + "\x1b[0m"
+	case scan.VerificationUnknown:
+		return "\x1b[33m" + label + "\x1b[0m"
+	}
+	return label
 }
 
 func paintSeverity(color bool, sev string) string {

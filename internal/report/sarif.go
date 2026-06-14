@@ -111,18 +111,39 @@ func WriteSARIF(w io.Writer, findings []scan.Finding, toolVersion string) error 
 		if _, exists := rulesByID[id]; exists {
 			continue
 		}
+		// Tag conventions:
+		//   - GitHub Code Scanning indexes `external/cwe/cwe-<n>` tags as
+		//     the CWE classification for the rule. Emitting two such tags
+		//     for multi-CWE categories (e.g. unsafe-tool-output) makes the
+		//     finding searchable under both CWE pages on the Security tab.
+		//   - The bare `cwe` / `owasp` properties are kept for back-compat
+		//     with consumers that read them; `cwes` / `owasps` arrays are
+		//     the multi-value forms used by newer consumers.
+		cwes := nonEmpty(f.CWE, f.SecondaryCWE)
+		owasps := nonEmpty(f.OWASP, f.SecondaryOWASP)
+		tags := []string{"security", f.Category}
+		for _, c := range cwes {
+			tags = append(tags, "external/cwe/"+slug(c))
+		}
+		props := map[string]interface{}{
+			"category": f.Category,
+			"cwe":      f.CWE,
+			"owasp":    f.OWASP,
+			"tags":     tags,
+		}
+		if len(cwes) > 1 {
+			props["cwes"] = cwes
+		}
+		if len(owasps) > 1 {
+			props["owasps"] = owasps
+		}
 		rulesByID[id] = sarifRule{
 			ID:               id,
 			Name:             ruleName(f),
 			ShortDescription: sarifMessage{Text: ruleName(f)},
 			FullDescription:  sarifMessage{Text: f.Explanation},
-			Properties: map[string]interface{}{
-				"category": f.Category,
-				"cwe":      f.CWE,
-				"owasp":    f.OWASP,
-				"tags":     []string{"security", f.Category},
-			},
-			DefaultConfig: &sarifConfig{Level: severityToLevel(f.Severity)},
+			Properties:       props,
+			DefaultConfig:    &sarifConfig{Level: severityToLevel(f.Severity)},
 		}
 	}
 	rules := make([]sarifRule, 0, len(rulesByID))
@@ -192,6 +213,19 @@ func ruleName(f scan.Finding) string {
 		return f.Pattern
 	}
 	return f.Title
+}
+
+// nonEmpty returns the input strings with empties dropped, preserving order.
+// Used to build the multi-CWE / multi-OWASP tag set without committing to
+// a fixed pair shape in the caller.
+func nonEmpty(xs ...string) []string {
+	out := make([]string, 0, len(xs))
+	for _, x := range xs {
+		if x != "" {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // slug lowercases and hyphenates an identifier. ASCII-only; the inputs are

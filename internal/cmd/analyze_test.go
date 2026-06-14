@@ -49,6 +49,62 @@ func TestCountAtOrAbove_NoFindings(t *testing.T) {
 	}
 }
 
+// FIX 15: --fail-on=verified-* must be an inclusion gate. Before this
+// fix, the only `verified-*`-specific behaviour was skipping
+// status="invalid" secrets — so a mix of `unknown` secrets + any SAST
+// finding fell through and the verified-high count matched plain high.
+// Lock the new semantics in: only LIVE secrets count under verified-*.
+func TestCountAtOrAbove_VerifiedHighIsInclusionGate(t *testing.T) {
+	valid := &scan.Verification{Status: scan.VerificationValid}
+	unknown := &scan.Verification{Status: scan.VerificationUnknown}
+	invalid := &scan.Verification{Status: scan.VerificationInvalid}
+	fs := []scan.Finding{
+		// One high SAST finding — never affirmatively verified locally.
+		{Severity: scan.SeverityHigh, Category: "sql-injection"},
+		// One high dep-CVE — same: no local affirmative signal.
+		{Severity: scan.SeverityHigh, Category: "dependency-cve"},
+		// One critical "unknown" secret — provider was down / not configured.
+		// `verified-*` should drop it; plain `high`/`critical` keeps it.
+		{Severity: scan.SeverityCritical, Category: "secrets", Verification: unknown},
+		// One critical "invalid" secret — regex hit, not a real key shape.
+		// Always excluded under verified-*.
+		{Severity: scan.SeverityCritical, Category: "secrets", Verification: invalid},
+		// One critical "valid" secret — provider 2xx'd. The single
+		// affirmative signal in the bag, so this is the only one counted.
+		{Severity: scan.SeverityCritical, Category: "secrets", Verification: valid},
+	}
+	// Plain `high`: all 5 are at >= high severity → all 5 count.
+	if got := countAtOrAbove(fs, "high"); got != 5 {
+		t.Errorf("countAtOrAbove(_, high) = %d, want 5", got)
+	}
+	// `verified-high`: only the one valid secret should count. Before the
+	// fix, the count was 4 (everything minus the "invalid" secret),
+	// matching plain `high` close enough to be useless as a precision
+	// lane.
+	if got := countAtOrAbove(fs, "verified-high"); got != 1 {
+		t.Errorf("countAtOrAbove(_, verified-high) = %d, want 1", got)
+	}
+	// `verified-critical`: same single finding, since it's critical.
+	if got := countAtOrAbove(fs, "verified-critical"); got != 1 {
+		t.Errorf("countAtOrAbove(_, verified-critical) = %d, want 1", got)
+	}
+}
+
+// `verified-*` against an all-unverified set must return 0 — the WHOLE
+// point of the high-precision lane. Before FIX 15 this test would have
+// returned len(fs) because the gate was inert.
+func TestCountAtOrAbove_VerifiedZeroWhenNothingVerified(t *testing.T) {
+	fs := []scan.Finding{
+		{Severity: scan.SeverityCritical, Category: "sql-injection"},
+		{Severity: scan.SeverityCritical, Category: "secrets"},
+		{Severity: scan.SeverityCritical, Category: "secrets", Verification: &scan.Verification{Status: scan.VerificationUnknown}},
+		{Severity: scan.SeverityCritical, Category: "dependency-cve"},
+	}
+	if got := countAtOrAbove(fs, "verified-high"); got != 0 {
+		t.Errorf("countAtOrAbove(_, verified-high) = %d, want 0 (no affirmative signals)", got)
+	}
+}
+
 func TestThresholdRank_UnknownDefaultsToHigh(t *testing.T) {
 	// Defense in depth: even if validation is bypassed, the rank function
 	// degrades to "high" rather than something silly like 0.

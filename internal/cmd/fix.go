@@ -108,6 +108,23 @@ type fixPatchResp struct {
 	} `json:"project"`
 }
 
+// validateFixLocalOnlyArgs gates the positional argument for
+// `getdebug fix --local-only`. FIX 16 (2026-06-06 dogfood): accept "."
+// and the obvious workdir aliases ("./", "./.", etc.) as no-ops because
+// every OTHER command on the CLI accepts "." as "the current workdir."
+// Rejecting it only here was a surprising paper cut. Anything that
+// doesn't `Clean` to "." is still rejected — a fix-id positional
+// alongside --local-only remains nonsensical.
+func validateFixLocalOnlyArgs(args []string) error {
+	if len(args) == 0 {
+		return nil
+	}
+	if filepath.Clean(args[0]) == "." {
+		return nil
+	}
+	return errors.New("`getdebug fix --local-only` operates on the workdir; remove the fix-id argument")
+}
+
 func runFix(cmd *cobra.Command, args []string) error {
 	if fixLocalOnly {
 		// --local-only never reaches getdebug servers — no auth, no
@@ -116,8 +133,8 @@ func runFix(cmd *cobra.Command, args []string) error {
 		if fixInteractive || fixCI {
 			return errors.New("--interactive and --ci are not yet supported alongside --local-only")
 		}
-		if len(args) > 0 {
-			return errors.New("`getdebug fix --local-only` operates on the workdir; remove the fix-id argument")
+		if err := validateFixLocalOnlyArgs(args); err != nil {
+			return err
 		}
 		return runFixLocalOnly(cmd)
 	}

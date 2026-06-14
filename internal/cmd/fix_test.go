@@ -122,3 +122,31 @@ func TestFilesFromPatch_SkipsDevNull(t *testing.T) {
 		t.Errorf("got %d files, want 0", len(files))
 	}
 }
+
+// FIX 16 (2026-06-06 dogfood): every other command accepts "." as the
+// workdir alias, so `getdebug fix . --local-only` must too. Pre-fix the
+// positional check was a flat rejection of len(args) > 0, which broke
+// muscle memory.
+func TestValidateFixLocalOnlyArgs(t *testing.T) {
+	cases := []struct {
+		args    []string
+		wantErr bool
+		why     string
+	}{
+		{nil, false, "no positional is the canonical form"},
+		{[]string{}, false, "empty slice == no positional"},
+		{[]string{"."}, false, "workdir alias accepted (FIX 16)"},
+		{[]string{"./"}, false, "trailing slash still cleans to '.'"},
+		{[]string{"./."}, false, "redundant slash+dot still cleans to '.'"},
+		{[]string{"fix_abc123"}, true, "a real fix-id positional is nonsensical with --local-only"},
+		{[]string{"src/foo.go"}, true, "a file path is not a workdir alias"},
+		{[]string{".."}, true, "parent dir is not the current workdir"},
+	}
+	for _, tc := range cases {
+		err := validateFixLocalOnlyArgs(tc.args)
+		gotErr := err != nil
+		if gotErr != tc.wantErr {
+			t.Errorf("validateFixLocalOnlyArgs(%v) gotErr=%v want=%v (%s)", tc.args, gotErr, tc.wantErr, tc.why)
+		}
+	}
+}

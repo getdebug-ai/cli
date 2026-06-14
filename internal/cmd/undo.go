@@ -27,10 +27,19 @@ newest wins.`,
 	RunE: runUndo,
 }
 
-var undoTimestamp string
+var (
+	undoTimestamp  string
+	undoKeepBackup bool
+)
 
 func init() {
 	undoCmd.Flags().StringVar(&undoTimestamp, "timestamp", "", "restore from .getdebug-backup-<TS> instead of the most recent")
+	// FIX 17 (2026-06-06 dogfood): default is now delete-after-restore,
+	// matching the user's mental model of "undo means undo." Pass
+	// --keep-backup when you want the directory left in place for an
+	// audit trail or a follow-up diff.
+	undoCmd.Flags().BoolVar(&undoKeepBackup, "keep-backup", false,
+		"keep the .getdebug-backup-<TS> directory after restore (default: delete it)")
 }
 
 func runUndo(cmd *cobra.Command, _ []string) error {
@@ -51,7 +60,19 @@ func runUndo(cmd *cobra.Command, _ []string) error {
 
 	cmd.Printf("Restored %d file(s), deleted %d new file(s) from %s.\n",
 		restored, deleted, filepath.Base(backupDir))
-	cmd.Printf("Backup retained at %s — delete it manually if you don't need it.\n", backupDir)
+	// FIX 17: delete the backup by default; --keep-backup opts out.
+	if undoKeepBackup {
+		cmd.Printf("Backup kept at %s (--keep-backup).\n", backupDir)
+		return nil
+	}
+	if err := os.RemoveAll(backupDir); err != nil {
+		// Soft-fail: the restore already succeeded, so we don't want to
+		// turn a transient permission error into a non-zero exit.
+		// Surface enough for the user to clean up by hand.
+		cmd.PrintErrf("Note: could not remove backup %s (%v) — delete it manually if you don't need it.\n", backupDir, err)
+		return nil
+	}
+	cmd.Printf("Removed backup %s. Pass --keep-backup next time to retain it.\n", filepath.Base(backupDir))
 	return nil
 }
 

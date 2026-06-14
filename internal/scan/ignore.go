@@ -57,28 +57,32 @@ type IgnoreRuleset struct {
 
 // BuiltInIgnorePatterns returns the conservative default exclusions
 // every scan applies unless the user passes --no-default-ignores.
-// Limited to patterns that are UNAMBIGUOUSLY test-scaffolding so the
-// defaults never silently drop real source code:
+// Three groups, all UNAMBIGUOUS so defaults never silently drop real
+// source code:
 //
-//   - **/*.test.{ts,tsx,js,jsx,mjs,cjs} — Jest / Vitest convention
-//   - **/*.spec.{ts,tsx,js,jsx,mjs,cjs} — Jest convention
-//   - **/*_test.go — Go convention (enforced by the toolchain)
-//   - **/test_*.py — pytest convention
-//   - **/*_test.py — pytest convention (alternative form)
-//   - **/__tests__/**, **/__fixtures__/**, **/__snapshots__/**,
-//     **/__mocks__/** — Jest's double-underscore convention is
-//     specifically reserved for test scaffolding
-//   - **/testdata/** — Go convention; `go build` itself ignores it
+//  1. Test scaffolding — unit-test files and reserved test directories.
+//  2. Local-dev env overrides — `.env.local`, `.env.<env>.local` — the
+//     framework-wide convention for gitignored per-dev secrets. The
+//     committed `.env` / `.env.production` shapes are NOT skipped: a
+//     real key in them is a real leak, and the scanner keeps catching
+//     it. Templates (`.env.example` etc.) are re-included by the
+//     secret-pass's own eligibility check.
+//  3. Scanner output / bundled fixture data — JSON files the bench
+//     harness writes that contain the secret patterns it found in
+//     fixtures, creating a recursive feedback loop on re-scan; and the
+//     fixture data the web app ships for the `/bench` page.
 //
 // Deliberately NOT included (too ambiguous):
 //   - fixtures/, bench/, examples/ — common legitimate directory
-//     names in user code
+//     names in user code (only the scoped scanner-output JSONs under
+//     them are skipped; the source code is still scanned)
 //   - **/__init__.py, conftest.py — Python markers that could be
 //     legit
 //
 // The user can always override with a `!` line in .getdebug-ignore.
 func BuiltInIgnorePatterns() []string {
 	return []string{
+		// ── Group 1: test scaffolding ────────────────────────────
 		// JS/TS test files
 		"**/*.test.ts",
 		"**/*.test.tsx",
@@ -104,6 +108,40 @@ func BuiltInIgnorePatterns() []string {
 		"**/__mocks__/**",
 		// Go's testdata convention (go build ignores it too)
 		"**/testdata/**",
+
+		// ── Group 2: local-dev env overrides ─────────────────────
+		// `.env.local` and `.env.<env>.local` are the framework-wide
+		// convention (Next.js, Vite, Vue, CRA, Astro all ship the same
+		// gitignore line) for "gitignored, per-developer local secrets."
+		// When they're in a scan workdir it's the dev's own secrets,
+		// not a committed leak. NOTE: `.env` / `.env.production` /
+		// `.env.development` etc. are NOT in this group — they're the
+		// shapes a careless commit would expose, so the scanner keeps
+		// flagging them. Templates (`.env.example` etc.) are already
+		// handled by the secret-pass's eligibility check.
+		"**/.env.local",
+		"**/.env.*.local",
+
+		// ── Group 3: scanner output + bundled fixture data ───────
+		// Bench harness output: each run writes a JSON file containing
+		// every secret pattern it found in the fixtures. The next scan
+		// finds them all again. Recursive feedback loop.
+		"**/bench/results/**",
+		"**/bench-results/**",
+		"**/benchmarks/results/**",
+		// Single-file fixture corpora bundled into the web app for
+		// display on the `/bench` page (or equivalent). Common shape:
+		// `bench-fixtures.json`, `<name>-bench-fixtures.json`.
+		"**/bench-fixtures.json",
+		"**/*-bench-fixtures.json",
+		// Coverage tool output — high-entropy file hashes, never holds
+		// real credentials. node_modules-shape skip pattern.
+		"**/coverage/**",
+		"**/.nyc_output/**",
+		// Tool audit logs / sidecar state — gstack browse audit, the
+		// vulnhuntr checkpoint dir, etc. Machine output, not source.
+		"**/.gstack/**",
+		"**/.vulnhuntr_checkpoint/**",
 	}
 }
 

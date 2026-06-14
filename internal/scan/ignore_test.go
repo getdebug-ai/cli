@@ -199,3 +199,93 @@ func TestEmptyAndDotPathAreNeverIgnored(t *testing.T) {
 		}
 	}
 }
+
+// ── Default ignores — local-dev env overrides (Group 2) ─────────
+// `.env.local` and `.env.<env>.local` are the framework-wide
+// convention (Next.js / Vite / Vue / CRA / Astro) for gitignored
+// per-developer secrets. Skipping them removes the noisiest source
+// of "secrets in a file that's meant to hold secrets" FPs without
+// losing the safety net for committed `.env` / `.env.production`
+// shapes — those still scan.
+func TestDefaultsIgnoreLocalEnvOverrides(t *testing.T) {
+	root := setupTree(t)
+	rules := LoadIgnoreRules(root, true, true, nil)
+	skip := []string{
+		".env.local",
+		".env.development.local",
+		".env.production.local",
+		".env.test.local",
+		"api/.env.local",
+		"workers/.env.local",
+		"packages/web/.env.local",
+	}
+	for _, rel := range skip {
+		if !rules.IsIgnored(rel) {
+			t.Errorf("local-override env file %q should be ignored by defaults", rel)
+		}
+	}
+	// Committed shapes — must keep scanning so a careless commit of a
+	// real key still trips. Plus templates, which are filtered by the
+	// secrets-pass eligibility check, not by these built-ins.
+	keep := []string{
+		".env",
+		".env.development",
+		".env.production",
+		".env.staging",
+		".env.test",
+		".env.example",
+		".env.sample",
+		".env.template",
+		".env.local.example", // template that mentions "local" — not a real local override
+		"api/.env.prod.example",
+		"packages/web/.env",
+	}
+	for _, rel := range keep {
+		if rules.IsIgnored(rel) {
+			t.Errorf("env file %q must NOT be ignored by defaults (committed shape or template)", rel)
+		}
+	}
+}
+
+// ── Default ignores — scanner output + fixture data (Group 3) ───
+// `bench/results/*.json` is the canonical case: each run writes a
+// JSON file containing every secret pattern the scanner found in
+// the fixtures. The next scan reads them and re-finds the same
+// strings — recursive feedback loop. Group 3 closes it for any
+// project shape, not just one named `bench/`.
+func TestDefaultsIgnoreScannerOutputAndFixtureData(t *testing.T) {
+	root := setupTree(t)
+	rules := LoadIgnoreRules(root, true, true, nil)
+	skip := []string{
+		"bench/results/latest.json",
+		"bench/results/run-2026-06-05.json",
+		"bench-results/snapshot.json",
+		"benchmarks/results/r1.json",
+		"web/public/bench-fixtures.json",
+		"web/public/python-bench-fixtures.json",
+		"coverage/lcov.info",
+		"coverage/coverage-final.json",
+		".nyc_output/processinfo.json",
+		".gstack/browse-audit.jsonl",
+		".vulnhuntr_checkpoint/state.json",
+	}
+	for _, rel := range skip {
+		if !rules.IsIgnored(rel) {
+			t.Errorf("scanner-output/fixture file %q should be ignored by defaults", rel)
+		}
+	}
+	// Source code under similarly named dirs must still scan. The
+	// "too ambiguous to skip wholesale" categories from the doc
+	// comment have to keep working.
+	keep := []string{
+		"bench/src/runner.ts",   // bench source, not output
+		"bench/fixtures/app.py", // fixture vulnerable code
+		"examples/intro/app.ts",
+		"fixtures/user.json",
+	}
+	for _, rel := range keep {
+		if rules.IsIgnored(rel) {
+			t.Errorf("source under bench/fixtures/examples %q must still scan", rel)
+		}
+	}
+}
