@@ -8,13 +8,23 @@ injection, untrusted tool output reaching shells and SQL, leaked model keys,
 PII in prompts, and more. Connect the hosted platform and you also get full
 LLM-driven SAST, reachable-CVE dependency scanning, and one-click fix PRs.
 
-```sh
-# Run once, no install, no account — fully offline:
-npx @getdebug/cli analyze .
+## Quick start
 
-# The CI gate that fails the build on critical/high findings:
-npx @getdebug/cli analyze . --ci --fail-on=high --sarif=results.sarif
+```sh
+# Install — pick one:
+npm i -g @getdebug/cli                 # global → the `getdebug` command
+brew install getdebug-ai/tap/getdebug  # homebrew tap
+npx @getdebug/cli analyze .            # …or run with zero install, no account
+
+# Scan the current repo — offline, no account, fully local:
+getdebug analyze .
+
+# CI gate that fails the build on critical/high findings:
+getdebug analyze . --ci --fail-on=high --sarif=results.sarif
 ```
+
+No Go toolchain needed — the npm package and Homebrew formula both pull a
+prebuilt binary for your platform. Requires Node 18+ (for the npm / npx path).
 
 ## What makes it different — AI-app security testing
 
@@ -74,11 +84,11 @@ Stripe, Paystack, GitLab, npm, SendGrid, Slack.
 
 ## Install
 
-```sh
-npx @getdebug/cli analyze .                    # one-shot, no install
-npm i -g @getdebug/cli && getdebug analyze .   # global install
-brew install getdebug-ai/tap/getdebug          # homebrew
-```
+Three ways, all shown in [Quick start](#quick-start) above:
+
+- **npm** — `npm i -g @getdebug/cli` installs the `getdebug` command globally.
+- **Homebrew** — `brew install getdebug-ai/tap/getdebug`.
+- **npx** — `npx @getdebug/cli …` runs with zero install, no account.
 
 The npm package is a thin launcher that downloads the right prebuilt Go binary
 for your platform on install — no Go toolchain required. Supported: macOS /
