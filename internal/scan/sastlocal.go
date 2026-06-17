@@ -76,6 +76,11 @@ type SastLocalOptions struct {
 	PerFileTimeout time.Duration
 	// Logf is an optional progress logger (printed to stderr by the CLI).
 	Logf func(format string, args ...any)
+	// OnlyFiles, when non-nil, restricts the pass to these workdir-relative
+	// (forward-slash) paths — the diff-scoped scan (analyze --diff-ref). This is
+	// where diff scoping pays off: the expensive per-file model calls only run on
+	// changed files. Nil means "every eligible file".
+	OnlyFiles map[string]bool
 }
 
 // SastLocalDefaultPerFileTimeout is the per-file timeout when none is set.
@@ -91,6 +96,12 @@ type SastLocalResult struct {
 	FilesSkipped    int // oversize / unreadable
 	Malformed       int // model responses we couldn't parse
 	Errors          int // transport / model errors
+	// Token usage across all successful model calls, for the CLI cost banner.
+	// Ollama is on-device (zero dollar cost); these drive the token line + the
+	// hosted-equivalent estimate.
+	LlmCalls     int
+	PromptTokens int
+	OutputTokens int
 }
 
 // Same languages the worker's SAST pass supports (TS/JS/TSX/JSX/Python/Go).
@@ -340,6 +351,11 @@ func ScanSastLocal(ctx context.Context, opts SastLocalOptions) (*SastLocalResult
 		if opts.IgnoreRules != nil && opts.IgnoreRules.IsIgnored(filepath.ToSlash(rel)) {
 			return nil
 		}
+		// Diff-scoped scan: skip files the change didn't touch (the cost win —
+		// the model never sees unchanged files).
+		if opts.OnlyFiles != nil && !opts.OnlyFiles[filepath.ToSlash(rel)] {
+			return nil
+		}
 		res.FilesConsidered++
 		candidates = append(candidates, candidate{abs: path, rel: rel})
 		return nil
@@ -410,7 +426,7 @@ func ScanSastLocal(ctx context.Context, opts SastLocalOptions) (*SastLocalResult
 		// stall the whole pass. Loud failure mode — log the timeout
 		// explicitly so the user knows what got dropped.
 		fileCtx, fileCancel := context.WithTimeout(ctx, opts.PerFileTimeout)
-		text, err := opts.Client.ChatJSON(fileCtx, model, []localllm.Message{
+		text, usage, err := opts.Client.ChatJSON(fileCtx, model, []localllm.Message{
 			{Role: "system", Content: system},
 			{Role: "user", Content: userMsg},
 		})
@@ -424,6 +440,11 @@ func ScanSastLocal(ctx context.Context, opts SastLocalOptions) (*SastLocalResult
 			}
 			continue
 		}
+		// Call succeeded — count its token spend even if the JSON below is
+		// malformed (the model still ran).
+		res.LlmCalls++
+		res.PromptTokens += usage.PromptTokens
+		res.OutputTokens += usage.OutputTokens
 
 		var parsed modelResponse
 		if err := json.Unmarshal([]byte(text), &parsed); err != nil {

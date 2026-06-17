@@ -109,10 +109,22 @@ Linux / Windows × x86\_64 / arm64.
 `--sarif=<path>` writes SARIF 2.1.0 for GitHub Code Scanning to ingest; `--json`
 emits NDJSON for downstream tooling. Any CI runner with Node 18+ works.
 
+On pull requests, scope the gate to the diff so it only flags what the PR
+touched (and the local-model pass only spends on changed files):
+
+```yaml
+- run: npx @getdebug/cli analyze . --ci --fail-on=high --diff-ref origin/${{ github.base_ref }}
+```
+
+Untracked-but-new files only appear in `--diff-ref` once committed (it diffs
+git refs); a pre-generated diff works too via `--diff-file <path>`.
+
 ## Commands
 
 - `getdebug analyze [path]` — the scan described above. Offline by default; add
-  `--local-llm` for the local-model SAST pass.
+  `--local-llm` for the local-model SAST pass. Add `--diff-ref <ref>` (or
+  `--diff-file <path>`) to scan only files changed vs a git ref — the fast PR
+  gate, and the local-llm pass only spends on what changed.
 - `getdebug login` — connect to the hosted platform (OAuth 2.0 device flow,
   RFC 8628).
 - `getdebug fix <id> [--apply]` — preview (default) or apply a generated patch;

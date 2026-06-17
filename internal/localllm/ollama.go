@@ -120,7 +120,16 @@ type Message struct {
 // caller lets each prompt own its own response schema.
 //
 // Temperature defaults to 0.1 (consistent classification, not creative).
-func (c *Client) ChatJSON(ctx context.Context, model string, messages []Message) (string, error) {
+// Usage reports the token counts Ollama returns for one chat call. The local
+// model runs on-device so the dollar cost is zero; these counts let the CLI
+// print a per-scan token banner (and a "what this would cost on a hosted model"
+// comparison that makes the air-gap's value explicit).
+type Usage struct {
+	PromptTokens int
+	OutputTokens int
+}
+
+func (c *Client) ChatJSON(ctx context.Context, model string, messages []Message) (string, Usage, error) {
 	body, err := json.Marshal(map[string]any{
 		"model":    model,
 		"messages": messages,
@@ -129,42 +138,47 @@ func (c *Client) ChatJSON(ctx context.Context, model string, messages []Message)
 		"options":  map[string]any{"temperature": 0.1},
 	})
 	if err != nil {
-		return "", fmt.Errorf("encode body: %w", err)
+		return "", Usage{}, fmt.Errorf("encode body: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/api/chat", bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return "", Usage{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	res, err := c.HTTP.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("request: %w", err)
+		return "", Usage{}, fmt.Errorf("request: %w", err)
 	}
 	defer res.Body.Close()
 	raw, err := io.ReadAll(res.Body)
 	if err != nil {
-		return "", fmt.Errorf("read body: %w", err)
+		return "", Usage{}, fmt.Errorf("read body: %w", err)
 	}
 	if res.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("ollama %d: %s", res.StatusCode, strings.TrimSpace(string(raw)))
+		return "", Usage{}, fmt.Errorf("ollama %d: %s", res.StatusCode, strings.TrimSpace(string(raw)))
 	}
+	// prompt_eval_count = input tokens, eval_count = generated tokens (Ollama's
+	// native field names). Absent on very old Ollama builds → zero, harmless.
 	var out struct {
-		Model   string  `json:"model"`
-		Message Message `json:"message"`
-		Done    bool    `json:"done"`
-		Error   string  `json:"error,omitempty"`
+		Model           string  `json:"model"`
+		Message         Message `json:"message"`
+		Done            bool    `json:"done"`
+		Error           string  `json:"error,omitempty"`
+		PromptEvalCount int     `json:"prompt_eval_count"`
+		EvalCount       int     `json:"eval_count"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return "", fmt.Errorf("decode response: %w (body=%s)", err, string(raw))
+		return "", Usage{}, fmt.Errorf("decode response: %w (body=%s)", err, string(raw))
 	}
 	if out.Error != "" {
-		return "", errors.New(out.Error)
+		return "", Usage{}, errors.New(out.Error)
 	}
+	usage := Usage{PromptTokens: out.PromptEvalCount, OutputTokens: out.EvalCount}
 	// Some models still wrap content in ```json fences despite format=json.
 	// Strip them so the caller's json.Unmarshal succeeds.
 	content := strings.TrimSpace(out.Message.Content)
 	content = strings.TrimPrefix(content, "```json")
 	content = strings.TrimPrefix(content, "```")
 	content = strings.TrimSuffix(content, "```")
-	return strings.TrimSpace(content), nil
+	return strings.TrimSpace(content), usage, nil
 }

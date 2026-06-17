@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/getdebug-ai/cli/internal/gitdiff"
 	"github.com/getdebug-ai/cli/internal/localllm"
 	"github.com/getdebug-ai/cli/internal/report"
 	"github.com/getdebug-ai/cli/internal/scan"
@@ -29,6 +30,8 @@ var (
 	analyzeLocalLLMTimeout  time.Duration
 	analyzeVerify           bool
 	analyzeOnlyVerified     bool
+	analyzeDiffRef          string
+	analyzeDiffFile         string
 )
 
 // ErrCIThresholdExceeded is returned by runAnalyze when --ci is set and at
@@ -123,6 +126,10 @@ func init() {
 		"after the secret scan, make one authenticated GET per distinct candidate key against the provider (OpenAI / Anthropic / xAI / GitHub / Stripe / Paystack) and record valid|invalid|unknown. Makes outbound calls, so it is auto-disabled under --local-llm (air-gap mode); also disable for air-gapped CI with --verify=false")
 	analyzeCmd.Flags().BoolVar(&analyzeOnlyVerified, "only-verified", false,
 		"hide secret findings whose verification returned `invalid`. Implies --verify. Does NOT silently drop unknown results — those still surface so a provider outage can't mask a real leak.")
+	analyzeCmd.Flags().StringVar(&analyzeDiffRef, "diff-ref", "",
+		"diff-scoped scan: only analyze files changed vs this git ref (e.g. origin/main, HEAD~1). The PR gate — fast, and the local-llm pass only spends on changed files.")
+	analyzeCmd.Flags().StringVar(&analyzeDiffFile, "diff-file", "",
+		"diff-scoped scan from a pre-generated unified diff file instead of --diff-ref (e.g. a CI artifact). Mutually exclusive with --diff-ref.")
 }
 
 func runAnalyze(cmd *cobra.Command, args []string) error {
@@ -157,6 +164,26 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 	}
 	if !info.IsDir() {
 		return fmt.Errorf("%s is not a directory", abs)
+	}
+
+	// Diff-scoped scan (--diff-ref / --diff-file): resolve the changed-file set
+	// once, up front. Nil = full scan. We narrow the expensive local-llm pass to
+	// these files (the cost win) and filter the final report to them — a PR gate
+	// that only flags what the change touched.
+	var changedFiles map[string]bool
+	if analyzeDiffRef != "" || analyzeDiffFile != "" {
+		changedFiles, err = gitdiff.ChangedSet(abs, analyzeDiffRef, analyzeDiffFile)
+		if err != nil {
+			return fmt.Errorf("--diff scope: %w", err)
+		}
+		if !analyzeQuiet {
+			src := analyzeDiffRef
+			if src == "" {
+				src = analyzeDiffFile
+			}
+			fmt.Fprintf(cmd.ErrOrStderr(),
+				"diff mode: %d changed file(s) vs %s — scanning only those\n", len(changedFiles), src)
+		}
 	}
 
 	if !analyzeQuiet {
@@ -253,6 +280,8 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 			MaxFiles:       analyzeLocalLLMMax,
 			PerFileTimeout: analyzeLocalLLMTimeout,
 			IgnoreRules:    rules,
+			OnlyFiles:      changedFiles, // nil = full scan; diff mode = changed only
+
 			Logf: func(format string, args ...any) {
 				if !analyzeQuiet {
 					fmt.Fprintf(cmd.ErrOrStderr(), "  "+format, args...)
@@ -268,6 +297,18 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 				sastRes.FilesScanned, sastRes.FilesConsidered,
 				time.Since(sastStart).Round(time.Second),
 				sastRes.Malformed, sastRes.Errors)
+			if sastRes.LlmCalls > 0 {
+				// The local model runs on-device → $0 in real spend. Show the
+				// tokens and what the same work would cost on a hosted model, so
+				// the air-gap's value (free local AI) is explicit. Reference rate:
+				// gemini-2.5-flash-lite list price ($0.10/M in, $0.40/M out) — an
+				// informational estimate, not a bill.
+				cloudUsd := float64(sastRes.PromptTokens)/1e6*0.10 + float64(sastRes.OutputTokens)/1e6*0.40
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"local-llm cost: %d tokens (%d in + %d out) over %d call(s) · $0.00 on-device (Ollama) · ≈ $%.4f on a hosted model\n",
+					sastRes.PromptTokens+sastRes.OutputTokens, sastRes.PromptTokens, sastRes.OutputTokens,
+					sastRes.LlmCalls, cloudUsd)
+			}
 		}
 		res.Findings = append(res.Findings, sastRes.Findings...)
 	}
@@ -278,6 +319,14 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 	// preserving so the secrets pass + regex prefilter rows stay
 	// first in the report — those are the highest-confidence findings.
 	res.Findings = dedupeFindings(res.Findings)
+
+	// Diff-scoped: keep only findings in changed files. The cheap passes
+	// (secrets, ai-app regex) scanned the whole tree; this scopes the REPORT to
+	// the change (the local-llm pass was already scoped at the walk). Done before
+	// verification so we don't make outbound whoami calls for out-of-scope keys.
+	if changedFiles != nil {
+		res.Findings = filterToChangedFiles(res.Findings, changedFiles)
+	}
 
 	// Secret verification: --only-verified implies --verify; treating
 	// either as on triggers the pass. We do it AFTER dedupe so the same
@@ -328,6 +377,19 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 // secrets pass + regex prefilter rows (which run first) shadow any
 // later LLM duplicate. Order-preserving — the report's ranking stays
 // stable.
+// filterToChangedFiles keeps only findings whose file is in the diff-scoped
+// changed set. Paths are compared in forward-slash form to match the set built
+// by gitdiff. Order-preserving.
+func filterToChangedFiles(in []scan.Finding, changed map[string]bool) []scan.Finding {
+	out := make([]scan.Finding, 0, len(in))
+	for _, f := range in {
+		if changed[filepath.ToSlash(f.FilePath)] {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
 func dedupeFindings(in []scan.Finding) []scan.Finding {
 	if len(in) <= 1 {
 		return in
