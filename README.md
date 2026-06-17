@@ -119,6 +119,50 @@ touched (and the local-model pass only spends on changed files):
 Untracked-but-new files only appear in `--diff-ref` once committed (it diffs
 git refs); a pre-generated diff works too via `--diff-file <path>`.
 
+## Scan only what changed (diff mode)
+
+For a pull-request gate, scope the scan to the diff. It's faster, and the
+local-model SAST pass only spends on changed files instead of the whole repo.
+
+```sh
+getdebug analyze . --diff-ref origin/main      # files changed vs a branch/ref
+getdebug analyze . --diff-ref HEAD~1           # …or vs the previous commit
+getdebug analyze . --diff-file pr.diff         # …or from a pre-generated diff
+```
+
+By default diff mode scans exactly the changed files (depth 0). Add
+`--diff-depth N` to also scan the **callers** of changed files — so a change to
+a shared module re-checks the handlers that depend on it:
+
+```sh
+getdebug analyze . --diff-ref origin/main --diff-depth 1   # changed files + direct importers
+```
+
+Caller resolution covers **JS/TS** (relative imports), **Python** (relative +
+package imports), **Go** (package imports, via `go.mod`), and **Ruby**
+(`require_relative`). Imports it can't resolve (e.g. a bare Ruby `require`, or
+Go without a `go.mod`) simply don't expand — those files still scan at depth 0.
+Notes:
+
+- Untracked new files only appear once committed (`--diff-ref` diffs git refs).
+- `--diff-ref` and `--diff-file` are mutually exclusive.
+
+## Cost visibility
+
+`getdebug` is honest about what AI analysis costs. The `--local-llm` pass runs
+on-device (Ollama), so it costs **nothing** — but it still reports the tokens it
+used and what the same work would have cost on a hosted model:
+
+```
+local-llm: analyzed 12 of 12 in 2m3s · 0 malformed · 0 errors
+local-llm cost: 18,402 tokens (15,1k in + 3,3k out) over 12 call(s) · $0.00 on-device (Ollama) · ≈ $0.0028 on a hosted model
+```
+
+For hosted scans, each run's estimated AI spend shows up in `getdebug status`
+(the `AI COST` column) and on the dashboard; a run that hit its server-side
+budget ceiling is flagged so a partial scan never looks clean. All cost figures
+are list-price estimates, not a bill — reconcile real spend with your provider.
+
 ## Commands
 
 - `getdebug analyze [path]` — the scan described above. Offline by default; add

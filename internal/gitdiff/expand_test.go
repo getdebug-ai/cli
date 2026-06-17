@@ -61,6 +61,39 @@ func TestExpandByImporters_PythonRelativeAndIndex(t *testing.T) {
 	}
 }
 
+func TestExpandByImporters_GoPackagePath(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{
+		"go.mod":             "module example.com/m\n\ngo 1.21\n",
+		"pkg/util/auth.go":   "package util\n\nfunc Check() bool { return true }\n",
+		"pkg/api/handler.go": "package api\n\nimport \"example.com/m/pkg/util\"\n\nvar _ = util.Check\n",
+		"pkg/other/x.go":     "package other\n\nimport \"fmt\"\n\nvar _ = fmt.Println\n",
+	})
+	out, added := ExpandByImporters(dir, map[string]bool{"pkg/util/auth.go": true}, 1)
+	if added != 1 || !out["pkg/api/handler.go"] {
+		t.Fatalf("want pkg/api/handler.go (imports the changed package), got %v (added=%d)", out, added)
+	}
+	if out["pkg/other/x.go"] {
+		t.Fatalf("did not expect pkg/other/x.go (imports only fmt), got %v", out)
+	}
+}
+
+func TestExpandByImporters_RubyRequireRelative(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{
+		"lib/auth.rb":      "def check; true; end\n",
+		"app/handler.rb":   "require_relative '../lib/auth'\n",
+		"app/unrelated.rb": "require 'json'\n",
+	})
+	out, _ := ExpandByImporters(dir, map[string]bool{"lib/auth.rb": true}, 1)
+	if !out["app/handler.rb"] {
+		t.Fatalf("want app/handler.rb (require_relative), got %v", out)
+	}
+	if out["app/unrelated.rb"] {
+		t.Fatalf("did not expect app/unrelated.rb (bare require), got %v", out)
+	}
+}
+
 func TestExpandByImporters_DepthZeroAndChaining(t *testing.T) {
 	dir := t.TempDir()
 	writeFiles(t, dir, map[string]string{
