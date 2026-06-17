@@ -53,10 +53,12 @@ type statusResp struct {
 		Status      string  `json:"status"`
 		Trigger     *string `json:"trigger"`
 		Branch      *string `json:"branch"`
-		Findings    int     `json:"findings"`
-		Fixes       int     `json:"fixes"`
-		CreatedAt   string  `json:"createdAt"`
-		CompletedAt *string `json:"completedAt"`
+		Findings         int      `json:"findings"`
+		Fixes            int      `json:"fixes"`
+		EstimatedCostUsd *float64 `json:"estimatedCostUsd"`
+		BudgetExceeded   bool     `json:"budgetExceeded"`
+		CreatedAt        string   `json:"createdAt"`
+		CompletedAt      *string  `json:"completedAt"`
 	} `json:"recentRuns"`
 	RecentPRs []struct {
 		Project      string  `json:"project"`
@@ -150,19 +152,20 @@ func renderStatus(w io.Writer, s *statusResp) {
 	} else {
 		fmt.Fprintln(w, "Recent runs:")
 		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "  WHEN\tPROJECT\tSTATUS\tBRANCH\tFINDINGS\tFIXES")
+		fmt.Fprintln(tw, "  WHEN\tPROJECT\tSTATUS\tBRANCH\tFINDINGS\tFIXES\tAI COST")
 		for _, r := range s.RecentRuns {
 			branch := "-"
 			if r.Branch != nil && *r.Branch != "" {
 				branch = *r.Branch
 			}
-			fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%d\t%d\n",
+			fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%d\t%d\t%s\n",
 				humanAgo(r.CreatedAt),
 				truncate(r.Project, 28),
 				r.Status,
 				truncate(branch, 16),
 				r.Findings,
 				r.Fixes,
+				runCost(r.EstimatedCostUsd, r.BudgetExceeded),
 			)
 		}
 		tw.Flush()
@@ -206,6 +209,20 @@ func humanAgo(iso string) string {
 	default:
 		return t.Format("2006-01-02")
 	}
+}
+
+// runCost formats a run's estimated AI spend for the status table. Runs that
+// predate cost tracking (or had no LLM pass) show "-"; a budget-capped run is
+// flagged so a partial scan is visible.
+func runCost(usd *float64, capped bool) string {
+	if usd == nil {
+		return "-"
+	}
+	s := fmt.Sprintf("$%.4f", *usd)
+	if capped {
+		s += " ⚠cap"
+	}
+	return s
 }
 
 func truncate(s string, n int) string {

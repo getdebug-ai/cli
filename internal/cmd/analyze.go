@@ -32,6 +32,7 @@ var (
 	analyzeOnlyVerified     bool
 	analyzeDiffRef          string
 	analyzeDiffFile         string
+	analyzeDiffDepth        int
 )
 
 // ErrCIThresholdExceeded is returned by runAnalyze when --ci is set and at
@@ -130,6 +131,8 @@ func init() {
 		"diff-scoped scan: only analyze files changed vs this git ref (e.g. origin/main, HEAD~1). The PR gate — fast, and the local-llm pass only spends on changed files.")
 	analyzeCmd.Flags().StringVar(&analyzeDiffFile, "diff-file", "",
 		"diff-scoped scan from a pre-generated unified diff file instead of --diff-ref (e.g. a CI artifact). Mutually exclusive with --diff-ref.")
+	analyzeCmd.Flags().IntVar(&analyzeDiffDepth, "diff-depth", 0,
+		"with --diff-ref/--diff-file, also scan files that import a changed file, N hops out (callers of changed code). 0 = changed files only. Resolves JS/TS + Python imports; Go/Ruby stay depth-0.")
 }
 
 func runAnalyze(cmd *cobra.Command, args []string) error {
@@ -176,13 +179,26 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("--diff scope: %w", err)
 		}
+		changedCount := len(changedFiles)
+		// Depth-N: pull in callers (files that import a changed file) so a change
+		// to a shared module also re-scans what depends on it.
+		var reachAdded int
+		if analyzeDiffDepth > 0 && changedCount > 0 {
+			changedFiles, reachAdded = gitdiff.ExpandByImporters(abs, changedFiles, analyzeDiffDepth)
+		}
 		if !analyzeQuiet {
 			src := analyzeDiffRef
 			if src == "" {
 				src = analyzeDiffFile
 			}
-			fmt.Fprintf(cmd.ErrOrStderr(),
-				"diff mode: %d changed file(s) vs %s — scanning only those\n", len(changedFiles), src)
+			if reachAdded > 0 {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"diff mode: %d changed file(s) vs %s + %d importer(s) at depth %d — scanning those\n",
+					changedCount, src, reachAdded, analyzeDiffDepth)
+			} else {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"diff mode: %d changed file(s) vs %s — scanning only those\n", changedCount, src)
+			}
 		}
 	}
 

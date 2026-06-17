@@ -124,7 +124,9 @@ git refs); a pre-generated diff works too via `--diff-file <path>`.
 - `getdebug analyze [path]` — the scan described above. Offline by default; add
   `--local-llm` for the local-model SAST pass. Add `--diff-ref <ref>` (or
   `--diff-file <path>`) to scan only files changed vs a git ref — the fast PR
-  gate, and the local-llm pass only spends on what changed.
+  gate, and the local-llm pass only spends on what changed. Add `--diff-depth 1`
+  to also scan the callers of changed files (resolves JS/TS + Python imports;
+  Go/Ruby stay at the changed files only).
 - `getdebug login` — connect to the hosted platform (OAuth 2.0 device flow,
   RFC 8628).
 - `getdebug fix <id> [--apply]` — preview (default) or apply a generated patch;
